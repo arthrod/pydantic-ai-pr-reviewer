@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "building-pydantic-ai-agents": {
+      "source": "pydantic/skills",
+      "sourceType": "github",
+      "skillPath": "skills/building-pydantic-ai-agents/SKILL.md",
+      "computedHash": "a0b2e7e033e2047d14108ebc16b16b3fa83111ee07166c9d831c5a8ddd1b60c5"
+    },
+    "logfire-instrumentation": {
+      "source": "pydantic/skills",
+      "sourceType": "github",
+      "skillPath": "skills/logfire-instrumentation/SKILL.md",
+      "computedHash": "f34ee81f4595472fc8eea0d479259c093b98b371d2a0a30d6bd5252ebeaff635"
+    },
+    "pydantic-ai-harness": {
+      "source": "pydantic/skills",
+      "sourceType": "github",
+      "skillPath": "skills/pydantic-ai-harness/SKILL.md",
+      "computedHash": "2952394792e0d1889f8fd9aabd65e70de7b4b4e27c46f5a50c2fa003830af940"
+    }
+  }
+}

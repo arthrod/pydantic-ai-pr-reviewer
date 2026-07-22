@@ -53,7 +53,7 @@ class EchoACPAgent:  # type: ignore[misc]
         self,
         *,
         stop_reason: Literal[
-            "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"
+            "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled",
         ] = "end_turn",
         usage: Usage | None = None,
     ) -> None:
@@ -63,7 +63,7 @@ class EchoACPAgent:  # type: ignore[misc]
         self.session_models: list[tuple[str, str]] = []
         self.prompts: list[tuple[str, str]] = []
         self.stop_reason: Literal[
-            "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"
+            "end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled",
         ] = stop_reason
         self.usage = usage
         self.client_capabilities: ClientCapabilities | None = None
@@ -92,19 +92,19 @@ class EchoACPAgent:  # type: ignore[misc]
         del method, params
 
     async def fork_session(
-        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any
+        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any,
     ) -> Any:
         del cwd, session_id, mcp_servers, kwargs
         return None
 
     async def list_sessions(
-        self, cursor: str | None = None, cwd: str | None = None, **kwargs: Any
+        self, cursor: str | None = None, cwd: str | None = None, **kwargs: Any,
     ) -> Any:
         del cursor, cwd, kwargs
         return None
 
     async def load_session(
-        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any
+        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any,
     ) -> Any:
         del cwd, session_id, mcp_servers, kwargs
         return None
@@ -120,7 +120,7 @@ class EchoACPAgent:  # type: ignore[misc]
         return None
 
     async def set_config_option(
-        self, config_id: str, session_id: str, value: Any, **kwargs: Any
+        self, config_id: str, session_id: str, value: Any, **kwargs: Any,
     ) -> None:
         del config_id, session_id, value, kwargs
 
@@ -342,9 +342,9 @@ async def test_acp_provider_maps_acp_stop_reasons_to_finish_reasons(
 ) -> None:
     acp_agent = EchoACPAgent(
         stop_reason=cast(
-            Literal["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"],
+            "Literal['end_turn', 'max_tokens', 'max_turn_requests', 'refusal', 'cancelled']",
             stop_reason,
-        )
+        ),
     )
     _provider, model = _build_provider_and_model(acp_agent)
 
@@ -492,19 +492,19 @@ class NoHandshakeACPAgent:  # type: ignore[misc]
         del method, params
 
     async def fork_session(
-        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any
+        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any,
     ) -> Any:
         del cwd, session_id, mcp_servers, kwargs
         return None
 
     async def list_sessions(
-        self, cursor: str | None = None, cwd: str | None = None, **kwargs: Any
+        self, cursor: str | None = None, cwd: str | None = None, **kwargs: Any,
     ) -> Any:
         del cursor, cwd, kwargs
         return None
 
     async def load_session(
-        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any
+        self, cwd: str, session_id: str, mcp_servers: list[Any] | None = None, **kwargs: Any,
     ) -> Any:
         del cwd, session_id, mcp_servers, kwargs
         return None
@@ -520,7 +520,7 @@ class NoHandshakeACPAgent:  # type: ignore[misc]
         return None
 
     async def set_config_option(
-        self, config_id: str, session_id: str, value: Any, **kwargs: Any
+        self, config_id: str, session_id: str, value: Any, **kwargs: Any,
     ) -> None:
         del config_id, session_id, value, kwargs
 
@@ -614,7 +614,7 @@ async def test_host_bridge_forwards_session_update_to_delegate_when_present() ->
             tool_call=ToolCallUpdate(tool_call_id="call-1"),
         ),
         lambda bridge: bridge.write_text_file(
-            content="data", path="/tmp/f", session_id="session-1"
+            content="data", path="/tmp/f", session_id="session-1",
         ),
         lambda bridge: bridge.read_text_file(path="/tmp/f", session_id="session-1"),
         lambda bridge: bridge.create_terminal(command="ls", session_id="session-1"),
@@ -639,7 +639,7 @@ async def test_host_bridge_delegates_filesystem_and_terminal_calls_to_host_clien
     bridge = AcpHostBridge(delegate=delegate)
 
     write_response = await bridge.write_text_file(
-        content="hello", path="/tmp/f", session_id="session-1"
+        content="hello", path="/tmp/f", session_id="session-1",
     )
     read_response = await bridge.read_text_file(path="/tmp/f", session_id="session-1")
     terminal_response = await bridge.create_terminal(command="ls", session_id="session-1")
@@ -674,9 +674,9 @@ async def test_host_bridge_on_connect_forwards_to_delegate_when_supported() -> N
     def on_connect_handler(conn: Any) -> None:
         connected.append(conn)
 
-    cast(Any, delegate).on_connect = on_connect_handler
+    cast("Any", delegate).on_connect = on_connect_handler
 
-    sentinel_agent = cast(AcpAgent, object())
+    sentinel_agent = cast("AcpAgent", object())
     bridge.on_connect(sentinel_agent)
 
     assert connected == [sentinel_agent]
@@ -764,7 +764,7 @@ def test_default_render_prompt_blocks_covers_system_tool_and_retry_parts() -> No
             UserPromptPart("What is the status?"),
             ToolReturnPart(tool_name="check_status", content="ok", tool_call_id="call-1"),
             RetryPromptPart(
-                content="please retry", tool_name="check_status", tool_call_id="call-1"
+                content="please retry", tool_name="check_status", tool_call_id="call-1",
             ),
         ],
     )

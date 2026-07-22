@@ -1,9 +1,31 @@
 [project]
 name = "pydantic-ai-pr-reviewer"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Autonomous PR reviewer: pydantic-ai + ACP (cline/crush), merges or closes PRs."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "pydantic-acp>=1.4.0",
+    "typer>=0.15.0",
+    "rich>=13.0.0",
+    "logfire>=3.0.0",
+    "pydantic>=2.0.0",
+    "gitpython>=3.1.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.22",
+    "ty>=0.0.61",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "ASYNC", "RUF"]
+ignore = ["E501"]
+
+[tool.ty.environment]
+python-version = "3.14"
