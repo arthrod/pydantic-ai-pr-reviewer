@@ -1,6 +1,7 @@
 from __future__ import annotations as _annotations
 
 import tomllib
+from importlib.metadata import requires, version
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -19,6 +20,8 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PromptResponse,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     ToolCallUpdate,
     Usage,
     UsageUpdate,
@@ -46,6 +49,25 @@ from pydantic_ai.providers import Provider
 from pydantic_ai.tools import ToolDefinition
 
 from .support import HostRecordingClient, RecordingClient
+
+
+def _model_config_option() -> SessionConfigOptionSelect:
+    """The ``model`` session config option an ACP agent must advertise to be selectable.
+
+    ``AcpProvider`` only switches models on an agent that returns a ``select`` config
+    option with id ``model`` from ``new_session``; without it, asking for a specific
+    ``model_name`` is a ``UserError`` instead of a ``set_config_option`` call.
+    """
+    return SessionConfigOptionSelect(
+        id="model",
+        name="Model",
+        type="select",
+        current_value="zed-agent",
+        options=[
+            SessionConfigSelectOption(value=model_name, name=model_name)
+            for model_name in ("zed-agent", "model-a", "model-b", "agent")
+        ],
+    )
 
 
 class EchoACPAgent:  # type: ignore[misc]
@@ -122,7 +144,9 @@ class EchoACPAgent:  # type: ignore[misc]
     async def set_config_option(
         self, config_id: str, session_id: str, value: Any, **kwargs: Any
     ) -> None:
-        del config_id, session_id, value, kwargs
+        del kwargs
+        if config_id == "model":
+            self.session_models.append((session_id, str(value)))
 
     async def set_session_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> None:
         del mode_id, session_id, kwargs
@@ -153,7 +177,10 @@ class EchoACPAgent:  # type: ignore[misc]
         del kwargs
         self.session_cwds.append(cwd)
         self.mcp_servers_seen.append(mcp_servers)
-        return NewSessionResponse(session_id=f"session-{len(self.session_cwds)}")
+        return NewSessionResponse(
+            session_id=f"session-{len(self.session_cwds)}",
+            config_options=[_model_config_option()],
+        )
 
     async def set_session_model(
         self,
@@ -161,8 +188,7 @@ class EchoACPAgent:  # type: ignore[misc]
         session_id: str,
         **kwargs: Any,
     ) -> None:
-        del kwargs
-        self.session_models.append((session_id, model_id))
+        del model_id, session_id, kwargs
 
     async def prompt(
         self,
@@ -195,7 +221,7 @@ def _build_provider_and_model(
     prompt_renderer: Any = None,
 ) -> tuple[AcpProvider, AcpModel]:
     """Construct an ``AcpProvider``/``AcpModel`` pair with this file's shared test defaults."""
-    provider = AcpProvider(agent=agent, cwd=cwd, prompt_renderer=prompt_renderer)
+    provider = AcpProvider(acp_agent=agent, cwd=cwd, prompt_renderer=prompt_renderer)
     model = AcpModel(model_name=model_name, provider=provider)
     return provider, model
 
@@ -230,9 +256,13 @@ async def test_pydantic_ai_agent_can_use_acp_as_just_a_provider() -> None:
 
 
 def test_pydantic_acp_requires_pydantic_ai_v2() -> None:
-    package_pyproject = Path("packages/adapters/pydantic-acp/pyproject.toml")
-    data: dict[str, Any] = tomllib.loads(package_pyproject.read_text())
-    dependencies: list[str] = data["project"]["dependencies"]
+    """``pydantic-acp`` must be built against pydantic-ai v2, never v1.
+
+    This repository consumes ``pydantic-acp`` as an installed distribution, not as a
+    path dependency inside the adapter's own monorepo, so the requirement is read
+    from the installed package metadata rather than a checked-in ``pyproject.toml``.
+    """
+    dependencies: list[str] = requires("pydantic-acp") or []
     pydantic_ai_dependency: str = next(
         dependency for dependency in dependencies if dependency.startswith("pydantic-ai-slim")
     )
@@ -260,7 +290,7 @@ async def test_acp_provider_reuses_session_and_model_across_multiple_requests() 
 
 def test_acp_provider_model_factory_uses_default_model_name() -> None:
     acp_agent = EchoACPAgent()
-    provider = AcpProvider(agent=acp_agent, cwd="/workspace")
+    provider = AcpProvider(acp_agent=acp_agent, cwd="/workspace")
 
     model = provider.model()
 
@@ -421,7 +451,7 @@ async def test_acp_model_request_stream_yields_the_buffered_response_text() -> N
 
 async def test_acp_provider_switches_session_model_when_model_name_changes() -> None:
     acp_agent = EchoACPAgent()
-    provider = AcpProvider(agent=acp_agent, cwd="/workspace")
+    provider = AcpProvider(acp_agent=acp_agent, cwd="/workspace")
     first_model = AcpModel(model_name="model-a", provider=provider)
     second_model = AcpModel(model_name="model-b", provider=provider)
 
@@ -440,7 +470,7 @@ async def test_acp_provider_forwards_client_capabilities_info_and_mcp_servers() 
     mcp_servers = [{"name": "demo"}]
 
     provider = AcpProvider(
-        agent=acp_agent,
+        acp_agent=acp_agent,
         cwd="/workspace",
         client_capabilities=capabilities,
         client_info=client_info,
@@ -456,7 +486,7 @@ async def test_acp_provider_forwards_client_capabilities_info_and_mcp_servers() 
 
 
 def test_acp_provider_model_profile_returns_the_shared_acp_profile() -> None:
-    provider = AcpProvider(agent=EchoACPAgent(), cwd="/workspace")
+    provider = AcpProvider(acp_agent=EchoACPAgent(), cwd="/workspace")
     assert provider.model_profile("anything") is client_module.ACP_MODEL_PROFILE
 
 
@@ -548,7 +578,7 @@ class NoHandshakeACPAgent:  # type: ignore[misc]
         **kwargs: Any,
     ) -> NewSessionResponse:
         del cwd, mcp_servers, kwargs
-        return NewSessionResponse(session_id="session-1")
+        return NewSessionResponse(session_id="session-1", config_options=[_model_config_option()])
 
     async def prompt(
         self,
@@ -563,7 +593,7 @@ class NoHandshakeACPAgent:  # type: ignore[misc]
 
 async def test_acp_provider_does_not_require_the_agent_to_support_on_connect() -> None:
     acp_agent = NoHandshakeACPAgent()
-    provider = AcpProvider(agent=acp_agent, cwd="/workspace")
+    provider = AcpProvider(acp_agent=acp_agent, cwd="/workspace")
     model = AcpModel(model_name="agent", provider=provider)
 
     response = await model.request(
@@ -923,7 +953,7 @@ async def test_host_bridge_usage_update_since_ignores_real_acp_usage_update_with
 async def test_acp_provider_forwards_host_client_delegate_updates_end_to_end() -> None:
     delegate = HostRecordingClient()
     acp_agent = EchoACPAgent()
-    provider = AcpProvider(agent=acp_agent, cwd="/workspace", host_client=delegate)
+    provider = AcpProvider(acp_agent=acp_agent, cwd="/workspace", host_client=delegate)
 
     assert provider.host.delegate is delegate
 
@@ -965,11 +995,19 @@ def test_root_pyproject_declares_pydantic_ai_v2_dependency() -> None:
 
 
 def test_pydantic_acp_pins_agent_client_protocol_version_used_by_client_module() -> None:
-    package_pyproject = Path("packages/adapters/pydantic-acp/pyproject.toml")
-    data: dict[str, Any] = tomllib.loads(package_pyproject.read_text())
-    dependencies: list[str] = data["project"]["dependencies"]
+    """``pydantic-acp`` must pin the exact ``acp`` release the client module imports.
 
-    assert "agent-client-protocol==0.9.0" in dependencies
+    The pin is asserted against the installed distributions rather than a hardcoded
+    version, so bumping ``agent-client-protocol`` keeps the two in lockstep instead
+    of silently drifting apart.
+    """
+    dependencies: list[str] = requires("pydantic-acp") or []
+    protocol_dependency: str = next(
+        dependency for dependency in dependencies if dependency.startswith("agent-client-protocol")
+    )
+    installed_protocol_version = version("agent-client-protocol")
+
+    assert protocol_dependency == f"agent-client-protocol=={installed_protocol_version}"
 
 
 # --- Additional coverage: public package exports for the client bridge (__init__.py) -----
