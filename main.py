@@ -123,7 +123,9 @@ def describe_exception(exc: BaseException) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-ProviderName = Literal["claude", "cline", "gemini", "opencode", "goose"]
+ProviderName = Literal[
+    "claude", "cline", "gemini", "opencode", "goose", "glm", "dirac", "vibe", "grok"
+]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -187,10 +189,53 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
         command=("goose", "acp"),
         description="goose ACP agent over stdio",
     ),
+    # The following three are dedicated `*-acp` stdio agents (not a `--acp`
+    # flag on a TUI). Each was handshake-verified: initialize + session/new
+    # succeed and they advertise real session modes. End-to-end output still
+    # depends on the user having provider credentials (see auth notes).
+    "glm": ProviderSpec(
+        key="glm",
+        # `glm-acp-agent` starts the ACP stdio loop directly (no subcommand).
+        # Auth: needs Z_AI_API_KEY in the environment or creds stored via
+        # `glm-acp-agent --setup`. Modes mirror Claude Code's.
+        command=("glm-acp-agent",),
+        modes=("default", "accept_edits", "bypass_permissions"),
+        description="Zhipu GLM via glm-acp-agent (ACP stdio)",
+    ),
+    "dirac": ProviderSpec(
+        key="dirac",
+        command=("dirac", "--acp"),
+        # Auth: openai-codex-oauth (stored). "act" makes changes and routes
+        # tool permissions to us; "yolo"/"auto" auto-approve as fallbacks.
+        modes=("act", "yolo", "auto"),
+        description="dirac in ACP mode (--acp)",
+    ),
+    "vibe": ProviderSpec(
+        key="vibe",
+        # `vibe-acp` (the ACP agent), NOT the Mistral `vibe` CLI, which has no
+        # ACP mode. Advertised no auth methods in the handshake.
+        command=("vibe-acp",),
+        modes=("default", "auto-approve", "accept-edits"),
+        description="vibe via vibe-acp (ACP stdio)",
+    ),
+    "grok": ProviderSpec(
+        key="grok",
+        # The ACP stdio agent lives under `grok agent stdio` (NOT `grok --acp`,
+        # which the TUI rejects). Auth: cached_token / grok.com (stored).
+        # Advertises no session modes, so there is no permission mode to set;
+        # our host delegate still auto-allows any permission requests.
+        command=("grok", "agent", "stdio"),
+        modes=(),
+        description="Grok via `grok agent stdio` (ACP stdio)",
+    ),
 }
 
 #: Order tried when the requested provider is unavailable or fails to start.
-FALLBACK_ORDER: tuple[ProviderName, ...] = ("claude", "cline", "opencode", "gemini", "goose")
+#: cline is kept but is known to accept prompts yet emit no output in 3.0.46
+#: (its --acp drops agent_message_chunk); the new *-acp agents come first.
+FALLBACK_ORDER: tuple[ProviderName, ...] = (
+    "claude", "glm", "dirac", "vibe", "grok", "cline", "opencode", "gemini", "goose"
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
