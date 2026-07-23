@@ -13,10 +13,14 @@ those tools render nicely in an ACP client:
 
 Run it with `python examples/pydantic/travel_agent.py`, or point an ACP client
 (such as Zed) at that command.
+
+The workspace confinement below relies on descriptor-relative `openat` calls, so
+this demo targets POSIX platforms (Linux/macOS); Windows lacks `dir_fd` support.
 """
 
 from __future__ import annotations as _annotations
 
+import os
 from pathlib import Path
 
 from pydantic_acp import AdapterConfig, FileSystemProjectionMap, HookProjectionMap, run_acp
@@ -50,13 +54,48 @@ def _ensure_travel_workspace() -> Path:
     return _TRAVEL_ROOT
 
 
-def _resolve_trip_path(path: str) -> Path:
-    """Resolve `path` inside the trip workspace, refusing to escape it."""
-    root = _ensure_travel_workspace().resolve()
-    resolved = (root / path).resolve()
-    if resolved != root and root not in resolved.parents:
+def _trip_path_parts(path: str) -> tuple[str, ...]:
+    """Split a tool-supplied `path` into workspace-relative components.
+
+    Anything that could name a file outside the workspace without touching the
+    filesystem -- an absolute path, a drive letter, a `..` segment -- is rejected
+    here, before any syscall runs.
+    """
+    candidate = Path(path)
+    if candidate.is_absolute() or candidate.drive:
         raise ValueError(f"{path!r} is outside the trip workspace")
-    return resolved
+    parts = tuple(part for part in candidate.parts if part != ".")
+    if not parts or ".." in parts:
+        raise ValueError(f"{path!r} is outside the trip workspace")
+    return parts
+
+
+def _open_containing_dir(parts: tuple[str, ...], *, create: bool) -> int:
+    """Open the directory that holds `parts[-1]` and return its descriptor.
+
+    Each component is opened relative to the previous descriptor with
+    `O_NOFOLLOW`, so the kernel -- not an earlier `resolve()` snapshot -- decides
+    what the name refers to at the moment it is used. That closes the
+    check-then-write race: a symlink swapped into the workspace after validation
+    makes the `openat` fail instead of silently redirecting the operation
+    outside the workspace. The caller owns the returned descriptor.
+    """
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    dir_fd = os.open(_ensure_travel_workspace(), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(component, dir_fd=dir_fd)
+                except FileExistsError:
+                    pass
+            child_fd = os.open(component, dir_flags, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = child_fd
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
 
 
 hooks = Hooks()
@@ -101,16 +140,36 @@ agent = Agent(
 @agent.tool_plain
 def read_trip_file(path: str, max_chars: int = 4000) -> str:
     """Read a file from the trip workspace, truncated to `max_chars` characters."""
-    content = _resolve_trip_path(path).read_text(encoding="utf-8")
-    return content[:max_chars]
+    if max_chars < 0:
+        # A negative limit would slice off the *tail* instead of bounding the
+        # prefix, quietly returning far more than the caller asked for.
+        raise ValueError("max_chars must be non-negative")
+    parts = _trip_path_parts(path)
+    dir_fd = _open_containing_dir(parts, create=False)
+    try:
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    with os.fdopen(file_fd, encoding="utf-8") as handle:
+        return handle.read(max_chars)
 
 
 @agent.tool_plain(requires_approval=True)
 def write_trip_file(path: str, content: str) -> str:
     """Write a file into the trip workspace. Requires the client's approval."""
-    target = _resolve_trip_path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    parts = _trip_path_parts(path)
+    dir_fd = _open_containing_dir(parts, create=True)
+    try:
+        file_fd = os.open(
+            parts[-1],
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=dir_fd,
+        )
+    finally:
+        os.close(dir_fd)
+    with os.fdopen(file_fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
     return f"wrote {len(content)} characters to {path}"
 
 
