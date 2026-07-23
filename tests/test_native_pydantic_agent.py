@@ -21,6 +21,7 @@ from .pydantic.support import (
 
 def _load_demo_module():
     module_path = Path(__file__).resolve().parents[1] / "examples" / "pydantic" / "travel_agent.py"
+    assert module_path.is_file(), f"demo module is missing: {module_path}"
     spec = importlib.util.spec_from_file_location("travel_agent_demo", module_path)
     assert spec is not None
     assert spec.loader is not None
