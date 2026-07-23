@@ -110,6 +110,59 @@ def describe_exception(exc: BaseException) -> str:
     return " ← caused by ".join(parts[:4])
 
 
+def _diagnose_empty_turn(
+    spec: ProviderSpec,
+    delegate: LocalHostDelegate,
+    exc: BaseException,
+) -> str:
+    """Explain a zero-text-chunk failure by its real underlying cause.
+
+    An empty ACP turn is *usually* an unauthenticated or broken agent, but it
+    is just as often a concrete provider error (rate limit, auth rejection,
+    upstream API failure). Blindly printing "unauthenticated or ACP broken"
+    when the chain clearly says "Rate limited" is actively misleading, so we
+    classify the cause and lead the message with it.
+    """
+    detail = describe_exception(exc)
+    lowered = detail.lower()
+    tools = f"{delegate.tool_calls} tool call(s) seen"
+
+    if any(s in lowered for s in ("rate limit", "rate_limit", "ratelimit", " 429", "too many requests")):
+        head = (
+            f"the {spec.key} provider's API rate-limited the request (transient). "
+            f"Wait and retry, or use a different --provider."
+        )
+    elif any(
+        s in lowered
+        for s in ("unauthenticated", "authentication", "auth_required", "auth required",
+                  "-32000", " 401", "unauthorized", "invalid api key", "invalid_api_key",
+                  "not logged in", "no credentials", "requires re-authentication", "sign in")
+    ):
+        head = (
+            f"the {spec.key} agent is not authenticated. Sign in or set its API key "
+            f"(e.g. run `{spec.executable}` interactively once), then retry."
+        )
+    elif any(s in lowered for s in ("connection", "network", "all connection attempts failed", "econnrefused")):
+        head = (
+            f"the {spec.key} agent could not reach its model backend ({tools}). "
+            f"Check that the backend/endpoint it is configured for is running."
+        )
+    elif any(s in lowered for s in ("exceeded maximum", "please return text", "without producing any text")):
+        # No concrete error surfaced: the agent genuinely returned an empty
+        # turn. This is the cline-style case — its ACP mode does not stream
+        # agent output.
+        head = (
+            f"the {spec.key} ACP agent completed its turn without producing any text "
+            f"output ({tools}) and reported no error — its ACP mode likely does not "
+            f"stream agent output. Verify with `{shlex.join(spec.command)}` directly."
+        )
+    else:
+        head = (
+            f"the {spec.key} ACP agent produced no text output ({tools})."
+        )
+    return f"{head} Underlying error: {detail}"
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # ACP provider registry
 #
@@ -163,9 +216,12 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
         key="claude",
         command=("npx", "-y", "@agentclientprotocol/claude-agent-acp"),
         env={"CLAUDECODE": "", "CLAUDE_CODE_ENTRYPOINT": "", "CLAUDE_CODE_SSE_PORT": ""},
-        # "default" makes the agent ask us for permission (we auto-allow).
-        # "bypassPermissions" / "acceptEdits" are fallbacks.
-        modes=("default", "acceptEdits", "bypassPermissions"),
+        # "bypassPermissions" is preferred: it skips Claude Code's own policy
+        # AND the Bash sandbox, so autonomous shell/gh/git never hit "blocked by
+        # policy" (which fires *inside* the agent, before our delegate is asked
+        # — especially when ~/.claude/settings.json sets defaultMode "dontAsk").
+        # "acceptEdits"/"default" (ask us, we auto-allow) are fallbacks.
+        modes=("bypassPermissions", "acceptEdits", "default"),
         description="Claude Code via @agentclientprotocol/claude-agent-acp",
     ),
     "cline": ProviderSpec(
@@ -176,8 +232,12 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
     ),
     "gemini": ProviderSpec(
         key="gemini",
-        command=("gemini", "--acp"),
-        description="Gemini CLI in ACP mode (--acp)",
+        # `--approval-mode yolo` auto-approves all tools (gemini has no ACP
+        # session modes). NOTE: gemini currently rejects session/new for
+        # individual accounts ("client no longer supported, migrate to
+        # Antigravity"), so this is unusable until that changes.
+        command=("gemini", "--acp", "--approval-mode", "yolo"),
+        description="Gemini CLI in ACP mode (--acp, yolo approvals)",
     ),
     "opencode": ProviderSpec(
         key="opencode",
@@ -187,6 +247,8 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
     "goose": ProviderSpec(
         key="goose",
         command=("goose", "acp"),
+        # "auto" auto-approves; "smart_approve" is a safer fallback.
+        modes=("auto", "smart_approve"),
         description="goose ACP agent over stdio",
     ),
     # The following three are dedicated `*-acp` stdio agents (not a `--acp`
@@ -199,7 +261,8 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
         # Auth: needs Z_AI_API_KEY in the environment or creds stored via
         # `glm-acp-agent --setup`. Modes mirror Claude Code's.
         command=("glm-acp-agent",),
-        modes=("default", "accept_edits", "bypass_permissions"),
+        # Prefer bypass_permissions for autonomous runs; fall back to ask-us.
+        modes=("bypass_permissions", "accept_edits", "default"),
         description="Zhipu GLM via glm-acp-agent (ACP stdio)",
     ),
     "dirac": ProviderSpec(
@@ -207,7 +270,8 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
         command=("dirac", "--acp"),
         # Auth: openai-codex-oauth (stored). "act" makes changes and routes
         # tool permissions to us; "yolo"/"auto" auto-approve as fallbacks.
-        modes=("act", "yolo", "auto"),
+        # "yolo" auto-approves every tool; "auto"/"act" are fallbacks.
+        modes=("yolo", "auto", "act"),
         description="dirac in ACP mode (--acp)",
     ),
     "vibe": ProviderSpec(
@@ -215,7 +279,8 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
         # `vibe-acp` (the ACP agent), NOT the Mistral `vibe` CLI, which has no
         # ACP mode. Advertised no auth methods in the handshake.
         command=("vibe-acp",),
-        modes=("default", "auto-approve", "accept-edits"),
+        # "auto-approve" runs tools without prompting; others are fallbacks.
+        modes=("auto-approve", "accept-edits", "default"),
         description="vibe via vibe-acp (ACP stdio)",
     ),
     "grok": ProviderSpec(
@@ -1186,14 +1251,12 @@ async def _run_review(
             # The single most confusing ACP failure: the agent completes its
             # turn but emits no agent_message_chunk at all. pydantic-ai then
             # reports "Exceeded maximum output retries", which says nothing
-            # about the real cause. Translate it.
+            # about the real cause. Translate it — but do NOT blindly blame
+            # auth/ACP: the empty turn is often caused by a concrete error
+            # (rate limit, auth, provider API error) that must lead the message.
             if delegate.text_chunks == 0:
                 raise ReviewFailed(
-                    f"the {spec.key} ACP agent completed its turn without producing any "
-                    f"text output ({delegate.tool_calls} tool call(s) seen). This almost "
-                    f"always means the agent is unauthenticated or its ACP mode is broken "
-                    f"— verify with `{shlex.join(spec.command)}` directly. "
-                    f"Underlying error: {describe_exception(exc)}"
+                    _diagnose_empty_turn(spec, delegate, exc)
                 ) from exc
             logfire.error("review_error", error=describe_exception(exc))
             raise ReviewFailed(describe_exception(exc)) from exc
