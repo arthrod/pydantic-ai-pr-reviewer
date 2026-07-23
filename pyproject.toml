@@ -1,0 +1,21 @@
+[project]
+name = "pydantic-ai-pr-reviewer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic-acp>=1.4.0",
+    "pydantic-ai>=2.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+# The suite writes bare `async def test_...` functions, so asyncio tests are
+# collected without needing a marker on every one of them.
+asyncio_mode = "auto"
