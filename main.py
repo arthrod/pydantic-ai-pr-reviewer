@@ -224,7 +224,7 @@ PROVIDERS: dict[ProviderName, ProviderSpec] = {
         # which the TUI rejects). Auth: cached_token / grok.com (stored).
         # Advertises no session modes, so there is no permission mode to set;
         # our host delegate still auto-allows any permission requests.
-        command=("grok", "agent", "stdio"),
+        command=("grok", "agent", "stdio", "--always-approve"),
         modes=(),
         description="Grok via `grok agent stdio` (ACP stdio)",
     ),
