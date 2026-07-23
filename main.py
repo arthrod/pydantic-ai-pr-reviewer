@@ -7,6 +7,14 @@
 #     "logfire>=3.0.0",
 #     "pydantic>=2.0.0",
 # ]
+#
+# # Source pydantic-acp from the local acpkit fork (path relative to this
+# # script), which carries fixes not on PyPI: clean agent-error propagation,
+# # authenticate-on-session/new, public ensure_session/set_session_mode, and
+# # raise_on_empty_turn. Without this, `uv run main.py` builds an ephemeral env
+# # from PyPI and none of those fixes are active.
+# [tool.uv.sources]
+# pydantic-acp = { path = "../acpkit/packages/adapters/pydantic-acp", editable = true }
 # ///
 
 """Tenancious PR Reviewer.
@@ -161,6 +169,38 @@ def _diagnose_empty_turn(
             f"the {spec.key} ACP agent produced no text output ({tools})."
         )
     return f"{head} Underlying error: {detail}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Transient-failure retry (rate limits, overload, dropped connections)
+#
+# pydantic-ai does NOT retry these for us: its ``retries`` default is None
+# (and only covers output/tool validation, not provider rate limits). So the
+# reviewer retries transient failures itself, with exponential backoff.
+# ═══════════════════════════════════════════════════════════════════════
+
+DEFAULT_MAX_RETRIES = 5
+_RETRY_BASE_SECONDS = 5.0
+_RETRY_CAP_SECONDS = 90.0
+
+_TRANSIENT_SIGNALS = (
+    "rate limit", "rate_limit", "ratelimit", "429", "too many requests",
+    "overloaded", "529", "503", "502", "temporarily unavailable",
+    "service unavailable", "connection reset", "connection refused",
+    "connection error", "econnreset", "econnrefused", "please try again",
+    "try again later", "server error",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Whether *exc*'s chain looks like a retryable transient provider error."""
+    lowered = describe_exception(exc).lower()
+    return any(s in lowered for s in _TRANSIENT_SIGNALS)
+
+
+def _retry_delay(attempt: int) -> float:
+    """Exponential backoff for the *attempt*-th failure (1-indexed)."""
+    return min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1192,6 +1232,12 @@ def _make_hooks() -> Hooks:
 class ReviewFailed(RuntimeError):
     """A review could not be completed — always carries a real reason."""
 
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        #: True when the failure looks transient (rate limit, overload, a
+        #: dropped connection) and is worth retrying with backoff.
+        self.retryable = retryable
+
 
 async def _run_review(
     pr_url: str,
@@ -1202,12 +1248,62 @@ async def _run_review(
     *,
     startup_timeout: float,
     verbose: bool,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[TenanciousReviewerResult, Sequence[ModelMessage]]:
-    """Run the reviewer agent. Returns (result, all_messages)."""
+    """Run the reviewer agent, retrying transient failures with backoff.
+
+    Each attempt starts a *fresh* ACP provider/session, so a retry recovers
+    from a dropped connection as well as a plain rate limit. Only failures
+    flagged ``retryable`` (rate limit, overload, connection) are retried;
+    auth errors, empty-turn/broken agents, and timeouts fail immediately.
+    """
     repo_path = Path(str(repo_path)).resolve()  # noqa: ASYNC240
     if not repo_path.is_dir():
         raise ReviewFailed(f"repository path does not exist: {repo_path}")
 
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await _attempt_review(
+                pr_url,
+                pr_number,
+                repo_path,
+                provider_name,
+                timeout_seconds,
+                startup_timeout=startup_timeout,
+                verbose=verbose,
+            )
+        except ReviewFailed as exc:
+            if not exc.retryable or attempt > max_retries:
+                raise
+            delay = _retry_delay(attempt)
+            console.print(
+                f"[yellow]⚠ attempt {attempt}/{max_retries + 1} hit a transient "
+                f"error:[/yellow] {exc}"
+            )
+            console.print(f"[yellow]  retrying in {delay:.0f}s…[/yellow]")
+            logfire.warning(
+                "review_retry",
+                attempt=attempt,
+                max_retries=max_retries,
+                delay=delay,
+                error=str(exc),
+            )
+            await asyncio.sleep(delay)
+
+
+async def _attempt_review(
+    pr_url: str,
+    pr_number: int,
+    repo_path: Path,
+    provider_name: ProviderName,
+    timeout_seconds: float,
+    *,
+    startup_timeout: float,
+    verbose: bool,
+) -> tuple[TenanciousReviewerResult, Sequence[ModelMessage]]:
+    """One review attempt: start a fresh ACP provider, run it, return result."""
     delegate = LocalHostDelegate(workspace_root=repo_path, verbose=verbose)
     provider, spec = await _start_provider(
         provider_name, repo_path, delegate, startup_timeout=startup_timeout
@@ -1254,12 +1350,13 @@ async def _run_review(
             # about the real cause. Translate it — but do NOT blindly blame
             # auth/ACP: the empty turn is often caused by a concrete error
             # (rate limit, auth, provider API error) that must lead the message.
+            transient = _is_transient(exc)
             if delegate.text_chunks == 0:
                 raise ReviewFailed(
-                    _diagnose_empty_turn(spec, delegate, exc)
+                    _diagnose_empty_turn(spec, delegate, exc), retryable=transient
                 ) from exc
             logfire.error("review_error", error=describe_exception(exc))
-            raise ReviewFailed(describe_exception(exc)) from exc
+            raise ReviewFailed(describe_exception(exc), retryable=transient) from exc
 
         delegate.finish()
         elapsed = time.monotonic() - started
@@ -1294,6 +1391,7 @@ def _do_review(
     timeout: float,
     *,
     startup_timeout: float = 120.0,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     dry_run: bool = False,
     verbose: bool = False,
 ) -> int:
@@ -1324,6 +1422,7 @@ def _do_review(
                 timeout,
                 startup_timeout=startup_timeout,
                 verbose=verbose,
+                max_retries=max_retries,
             )
         )
     except (ReviewFailed, AcpStartupError) as exc:
@@ -1435,6 +1534,7 @@ def _review_open_prs(
     verbose: bool,
     state: dict[str, str],
     repo_slug: str | None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[int, int]:
     """Review every eligible open PR. Returns (processed, failures)."""
     prs = list_open_prs(repo_path)
@@ -1471,6 +1571,7 @@ def _review_open_prs(
             repo_path,
             provider_name,
             timeout,
+            max_retries=max_retries,
             dry_run=dry_run,
             verbose=verbose,
         )
@@ -1513,6 +1614,14 @@ DryRunOpt = Annotated[
     bool,
     typer.Option("--dry-run", help="Review but never merge or close"),
 ]
+MaxRetriesOpt = Annotated[
+    int,
+    typer.Option(
+        "--max-retries",
+        help="Retries for transient failures (rate limit, overload, dropped "
+        "connection) with exponential backoff. 0 disables retrying.",
+    ),
+]
 
 
 @app.callback()
@@ -1547,6 +1656,7 @@ def review(
     repo_path: RepoOpt = Path.cwd(),
     provider: ProviderOpt = "claude",
     timeout: TimeoutOpt = 900.0,
+    max_retries: MaxRetriesOpt = DEFAULT_MAX_RETRIES,
     dry_run: DryRunOpt = False,
 ) -> None:
     """Review one PR, implement its comments, then merge or close it."""
@@ -1555,6 +1665,7 @@ def review(
         repo_path.resolve(),
         provider,
         timeout,
+        max_retries=max_retries,
         dry_run=dry_run,
         verbose=_VERBOSE["on"],
     )
@@ -1567,6 +1678,7 @@ def review_all(
     repo_path: RepoOpt = Path.cwd(),
     provider: ProviderOpt = "claude",
     timeout: TimeoutOpt = 900.0,
+    max_retries: MaxRetriesOpt = DEFAULT_MAX_RETRIES,
     dry_run: DryRunOpt = False,
     include_drafts: Annotated[
         bool, typer.Option("--include-drafts", help="Also review draft PRs")
@@ -1589,6 +1701,7 @@ def review_all(
         verbose=_VERBOSE["on"],
         state=state,
         repo_slug=repo_slug,
+        max_retries=max_retries,
     )
 
     if failures:
@@ -1605,6 +1718,7 @@ def watch(
     interval: Annotated[
         float, typer.Option("--interval", "-i", help="Seconds between polling cycles")
     ] = 300.0,
+    max_retries: MaxRetriesOpt = DEFAULT_MAX_RETRIES,
     dry_run: DryRunOpt = False,
     include_drafts: Annotated[
         bool, typer.Option("--include-drafts", help="Also review draft PRs")
@@ -1643,6 +1757,7 @@ def watch(
                 verbose=_VERBOSE["on"],
                 state=state,
                 repo_slug=repo_slug,
+                max_retries=max_retries,
             )
             if processed:
                 console.print(
