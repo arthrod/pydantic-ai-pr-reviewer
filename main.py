@@ -6,30 +6,40 @@
 #     "rich>=13.0.0",
 #     "logfire>=3.0.0",
 #     "pydantic>=2.0.0",
-#     "gitpython>=3.1.0",
 # ]
 # ///
 
 """Tenancious PR Reviewer.
 
-Autonomous PR reviewer that wraps an ACP agent (cline/crush) in a pydantic-ai
-``Agent``, asks it to address every review comment, then merges or closes the
-PR based on the structured ``TenanciousReviewerResult.final_decision``.
+Autonomous PR reviewer that wraps an ACP agent (claude / cline / gemini /
+opencode / goose) in a pydantic-ai ``Agent``, asks it to address every review
+comment, then merges or closes the PR based on the structured
+``TenanciousReviewerResult.final_decision``.
 
-Designed for fully-autonomous operation: no human-in-the-loop prompts, no
-confirmation steps. The pydantic-ai structured output is trusted blindly —
-``result.output.final_decision`` drives the merge/close decision directly.
+Designed for fully-autonomous, continuous operation: no human-in-the-loop
+prompts. ACP permission requests are auto-allowed by :class:`LocalHostDelegate`.
+
+Failure philosophy
+------------------
+Every failure path must say *why*. The previous revision printed a bare
+``Fatal error:`` with an empty message because ``str(TimeoutError())`` is the
+empty string. :func:`describe_exception` guarantees a non-empty description,
+and :func:`_run_review` distinguishes "the ACP agent never produced text"
+(a broken/unauthenticated agent) from ordinary model errors.
 """
 
 from __future__ import annotations as _annotations
 
 import asyncio
+import inspect
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
-from collections.abc import Sequence
+import time
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,7 +63,8 @@ from acp.schema import (
     WriteTextFileResponse,
 )
 from pydantic import BaseModel, Field
-from pydantic_acp import create_acp_model
+from pydantic_acp import AcpProvider
+from pydantic_acp.command_agent import AcpCommandAgent, AcpCommandOptions
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities.hooks import Hooks
 from pydantic_ai.messages import (
@@ -66,21 +77,129 @@ from pydantic_ai.messages import (
 from pydantic_ai.output import PromptedOutput
 from rich.console import Console, Group
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn
 from rich.syntax import Syntax
 from rich.table import Table
 
-console = Console(highlight=False, force_terminal=True)
-err_console = Console(stderr=True, highlight=False, force_terminal=True)
+console = Console(highlight=False)
+err_console = Console(stderr=True, highlight=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Error description — never render an empty reason.
+#
+# ``str(TimeoutError())`` is ``""``. So is ``str(CancelledError())`` and a
+# surprising number of asyncio/JSON-RPC errors. Printing ``f"{exc}"`` for
+# those produces the infamous "failed with no indication of the reason".
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Return a human-readable, guaranteed non-empty description of *exc*."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip()
+        name = type(current).__name__
+        parts.append(f"{name}: {text}" if text else name)
+        current = current.__cause__ or current.__context__
+
+    # Cap the chain so a deep context stack doesn't flood the terminal.
+    return " ← caused by ".join(parts[:4])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ACP provider registry
+#
+# These commands are the *only* thing that puts each CLI into ACP stdio
+# mode. Launching the bare binary (e.g. ``cline``) starts its normal
+# interactive/prompt mode, which never speaks JSON-RPC — the handshake
+# then hangs until the review timeout with no diagnostic at all.
+#
+# ``crush`` is deliberately absent: it has no ACP mode whatsoever
+# (``crush acp`` → 'Unknown command "acp"'), so it can never serve here.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+ProviderName = Literal["claude", "cline", "gemini", "opencode", "goose"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProviderSpec:
+    """How to launch one ACP agent and drive it autonomously."""
+
+    key: ProviderName
+    command: tuple[str, ...]
+    #: Environment overrides applied on top of ``os.environ`` for the child.
+    env: Mapping[str, str] = field(default_factory=dict)
+    #: Session permission modes to try, best-effort, in order. The first one
+    #: the agent accepts wins. Picking a mode that routes permission requests
+    #: to *us* is what makes autonomous operation possible.
+    modes: tuple[str, ...] = ()
+    description: str = ""
+
+    @property
+    def executable(self) -> str:
+        return self.command[0]
+
+    def available(self) -> str | None:
+        """Return the resolved executable path, or ``None`` when missing."""
+        return shutil.which(self.executable)
+
+
+PROVIDERS: dict[ProviderName, ProviderSpec] = {
+    # Claude Code via the official ACP adapter. Verified working end-to-end:
+    # streams agent_message_chunk, emits tool_call updates, and routes tool
+    # permissions to the ACP client.
+    #
+    # CLAUDECODE is blanked because the adapter refuses to start "inside
+    # another Claude Code session". We are deliberately launching a separate
+    # agent process, so the nested-session guard does not apply.
+    "claude": ProviderSpec(
+        key="claude",
+        command=("npx", "-y", "@agentclientprotocol/claude-agent-acp"),
+        env={"CLAUDECODE": "", "CLAUDE_CODE_ENTRYPOINT": "", "CLAUDE_CODE_SSE_PORT": ""},
+        # "default" makes the agent ask us for permission (we auto-allow).
+        # "bypassPermissions" / "acceptEdits" are fallbacks.
+        modes=("default", "acceptEdits", "bypassPermissions"),
+        description="Claude Code via @agentclientprotocol/claude-agent-acp",
+    ),
+    "cline": ProviderSpec(
+        key="cline",
+        command=("cline", "--acp"),
+        modes=("act",),
+        description="Cline CLI in ACP mode (--acp)",
+    ),
+    "gemini": ProviderSpec(
+        key="gemini",
+        command=("gemini", "--acp"),
+        description="Gemini CLI in ACP mode (--acp)",
+    ),
+    "opencode": ProviderSpec(
+        key="opencode",
+        command=("opencode", "acp"),
+        description="opencode ACP server",
+    ),
+    "goose": ProviderSpec(
+        key="goose",
+        command=("goose", "acp"),
+        description="goose ACP agent over stdio",
+    ),
+}
+
+#: Order tried when the requested provider is unavailable or fails to start.
+FALLBACK_ORDER: tuple[ProviderName, ...] = ("claude", "cline", "opencode", "gemini", "goose")
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # ACP delegate client — real filesystem + terminal access for the
-# external ACP agent (cline / crush) via the ACP host bridge.
+# external ACP agent via the ACP host bridge.
 #
 # The ACP schema uses camelCase kwargs (e.g. ``optionId``, ``terminalId``).
 # These are the authoritative names — do NOT attempt to pass snake_case
-# variants; pydantic will silently discard them and ty/ruff will flag it.
+# variants; pydantic will silently discard them.
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -99,20 +218,28 @@ class _ManagedTerminal:
 
 
 class LocalHostDelegate:
-    """An :class:`acp.interfaces.Client` implementation that performs
-    real filesystem I/O and terminal execution on the local machine.
+    """An :class:`acp.interfaces.Client` that performs real filesystem I/O and
+    terminal execution locally, auto-allows every permission request, and
+    renders live agent progress to the console.
 
-    Passed to :func:`pydantic_acp.create_acp_model` so the external ACP
-    agent (cline / crush) can read, write, and execute commands through
-    the standard ACP host bridge.
+    The live rendering matters: without it an ACP run is a black box, and a
+    silently-failing agent looks identical to a slow one.
     """
 
-    def __init__(self, *, workspace_root: Path | None = None) -> None:
+    def __init__(self, *, workspace_root: Path | None = None, verbose: bool = False) -> None:
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
+        self.verbose = verbose
         self._terminals: dict[str, _ManagedTerminal] = {}
         # Keep strong refs to background drain tasks so the asyncio GC
         # doesn't reap them mid-flight (ruff RUF006).
         self._drain_tasks: set[asyncio.Task[None]] = set()
+        #: Counters used to explain an empty run after the fact.
+        self.text_chunks = 0
+        self.tool_calls = 0
+        self.permissions_granted = 0
+        self._text_buffer: list[str] = []
+        #: tool_call_id → title, so completion updates can be labelled.
+        self._tool_titles: dict[str, str] = {}
 
     # -- permission -------------------------------------------------
 
@@ -123,15 +250,85 @@ class LocalHostDelegate:
         options: list[PermissionOption],
         **kwargs: Any,
     ) -> RequestPermissionResponse:
-        del session_id, tool_call, kwargs
-        # Auto-allow for autonomous PR review — no human in the loop.
-        allow = next((o for o in options if o.kind == "allow_once"), options[0])
+        del session_id, kwargs
+        # Prefer allow_always so repeated tool use doesn't round-trip.
+        allow = (
+            next((o for o in options if o.kind == "allow_always"), None)
+            or next((o for o in options if o.kind == "allow_once"), None)
+            or options[0]
+        )
+        self.permissions_granted += 1
+        title = getattr(tool_call, "title", None) or getattr(tool_call, "tool_call_id", "?")
+        console.print(f"  [dim green]✓ auto-allowed[/dim green] [dim]{title}[/dim]")
         # AllowedOutcome requires both ``option_id`` AND ``outcome="selected"``;
-        # leaving ``outcome`` off will raise a validation error at runtime.
+        # leaving ``outcome`` off raises a validation error at runtime.
         logfire.info("acp.permission_auto_allowed", option_id=allow.option_id)
         return RequestPermissionResponse(
             outcome=AllowedOutcome(option_id=allow.option_id, outcome="selected")
         )
+
+    # -- session updates → live progress ----------------------------
+
+    async def session_update(
+        self,
+        session_id: str,
+        update: Any,
+        **kwargs: Any,
+    ) -> None:
+        del session_id, kwargs
+        kind = getattr(update, "session_update", None) or getattr(update, "sessionUpdate", None)
+
+        if kind == "agent_message_chunk":
+            content = getattr(update, "content", None)
+            text = getattr(content, "text", None)
+            if isinstance(text, str) and text:
+                self.text_chunks += 1
+                self._text_buffer.append(text)
+                # Flush on sentence/newline boundaries to keep output readable.
+                if "\n" in text or len("".join(self._text_buffer)) > 220:
+                    self._flush_text()
+
+        elif kind in ("tool_call", "tool_call_update"):
+            status = getattr(update, "status", None)
+            title = getattr(update, "title", None)
+            call_id = getattr(update, "tool_call_id", None) or getattr(update, "toolCallId", None)
+
+            # The title only rides along on the *first* update for a tool call;
+            # the terminal completed/failed update carries the id and status but
+            # no title. Remember titles by id or every tool line renders blank.
+            if call_id and title:
+                self._tool_titles[str(call_id)] = str(title)
+            if kind == "tool_call":
+                self.tool_calls += 1
+
+            label = title or (self._tool_titles.get(str(call_id)) if call_id else None)
+            if status in ("completed", "failed"):
+                self._flush_text()
+                colour = "green" if status == "completed" else "red"
+                mark = "✓" if status == "completed" else "✗"
+                console.print(
+                    f"  [{colour}]{mark}[/{colour}] [dim]{str(label or 'tool')[:110]}[/dim]"
+                )
+                if call_id:
+                    self._tool_titles.pop(str(call_id), None)
+            elif label and self.verbose:
+                console.print(f"  [dim]· {str(label)[:110]}[/dim]")
+
+        elif kind == "agent_thought_chunk" and self.verbose:
+            content = getattr(update, "content", None)
+            text = getattr(content, "text", None)
+            if isinstance(text, str) and text.strip():
+                console.print(f"  [dim italic]{text.strip()[:160]}[/dim italic]")
+
+    def _flush_text(self) -> None:
+        buffered = "".join(self._text_buffer).strip()
+        self._text_buffer.clear()
+        if buffered:
+            console.print(f"  [cyan]│[/cyan] {buffered}")
+
+    def finish(self) -> None:
+        """Flush any buffered agent text (call once the turn is over)."""
+        self._flush_text()
 
     # -- filesystem -------------------------------------------------
 
@@ -145,9 +342,9 @@ class LocalHostDelegate:
     ) -> ReadTextFileResponse:
         del session_id, kwargs
         resolved = self._resolve(path)
-        # ReadTextFileResponse has only one field: ``content: str``.
-        # There is NO ``path`` or ``error`` field — errors must be
-        # encoded INTO the content string. ``content`` cannot be None.
+        # ReadTextFileResponse has only one field: ``content: str``. There is
+        # NO ``path`` or ``error`` field — errors must be encoded INTO the
+        # content string, and ``content`` cannot be None.
         with logfire.span("acp.read_text_file", path=path) as span:
             if not resolved.is_file():
                 span.set_attribute("found", False)
@@ -155,8 +352,8 @@ class LocalHostDelegate:
             try:
                 raw = resolved.read_text(encoding="utf-8")
             except Exception as exc:  # any read failure → content
-                span.set_attribute("error", str(exc))
-                return ReadTextFileResponse(content=f"ERROR: {exc}")
+                span.set_attribute("error", describe_exception(exc))
+                return ReadTextFileResponse(content=f"ERROR: {describe_exception(exc)}")
             span.set_attribute("bytes", len(raw))
             content = raw
             if line is not None or limit is not None:
@@ -203,9 +400,6 @@ class LocalHostDelegate:
         for ev in env or []:
             merged_env[ev.name] = ev.value
 
-        # Span the subprocess creation so we can see what the ACP agent
-        # is executing in Logfire / on stdout — without this the delegate
-        # is a black box per the logfire-instrumentation skill.
         with logfire.span(
             "acp.create_terminal",
             terminal_id=terminal_id,
@@ -228,10 +422,10 @@ class LocalHostDelegate:
             cwd=str(run_cwd),
         )
         self._terminals[terminal_id] = managed
-        # Hold a strong ref to the drain task or ruff/asyncio will complain.
         task = asyncio.ensure_future(self._drain_terminal(managed))
         self._drain_tasks.add(task)
         task.add_done_callback(self._drain_tasks.discard)  # type: ignore[arg-type]
+        console.print(f"  [dim]$ {shlex.join(cmd_parts)[:110]}[/dim]")
         logfire.info("acp.terminal_created", terminal_id=terminal_id)
         return CreateTerminalResponse(terminal_id=terminal_id)
 
@@ -262,8 +456,6 @@ class LocalHostDelegate:
         except Exception:
             managed.exit_code = -1
         managed.done.set()
-        # Emit a structured log line so the exit is visible in stdout /
-        # Logfire — per logfire-instrumentation skill.
         logfire.info(
             "acp.terminal_exited",
             terminal_id=managed.terminal_id,
@@ -281,8 +473,8 @@ class LocalHostDelegate:
         del session_id, kwargs
         managed = self._terminals.get(terminal_id)
         # TerminalOutputResponse fields: ``output: str``, ``truncated: bool``.
-        # There is NO ``terminal_id`` and NO ``error`` field — errors must
-        # go INTO ``output``. ``truncated`` is required.
+        # There is NO ``terminal_id`` and NO ``error`` field — errors go INTO
+        # ``output``, and ``truncated`` is required.
         if managed is None:
             return TerminalOutputResponse(
                 output=f"ERROR: No terminal found with id {terminal_id}",
@@ -302,9 +494,9 @@ class LocalHostDelegate:
     ) -> WaitForTerminalExitResponse:
         del session_id, kwargs
         managed = self._terminals.get(terminal_id)
-        # WaitForTerminalExitResponse: ``exit_code: int | None``.
-        # No ``terminal_id``, no ``error``. exit_code must be ≥ 0; use
-        # None when the terminal is missing instead of a sentinel like -1.
+        # WaitForTerminalExitResponse: ``exit_code: int | None``. No
+        # ``terminal_id``, no ``error``. exit_code must be >= 0; use None when
+        # the terminal is missing rather than a sentinel like -1.
         if managed is None:
             return WaitForTerminalExitResponse(exit_code=None)
         await managed.done.wait()
@@ -340,14 +532,6 @@ class LocalHostDelegate:
 
     # -- session / misc ---------------------------------------------
 
-    async def session_update(
-        self,
-        session_id: str,
-        update: Any,
-        **kwargs: Any,
-    ) -> None:
-        del session_id, update, kwargs
-
     async def create_elicitation(self, message: str, mode: Any, **kwargs: Any) -> Any:
         del message, mode, kwargs
         raise RuntimeError("Elicitation not supported in autonomous mode")
@@ -377,20 +561,12 @@ class LocalHostDelegate:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Structured output — the single thing the agent must return.
-# Pydantic AI guarantees the object; trust `result.output.final_decision`.
+# Structured output
 # ═══════════════════════════════════════════════════════════════════════
 
 
 class TenanciousReviewerResult(BaseModel):
-    """Final structured result returned by the PR reviewer agent.
-
-    Usage::
-
-        result = await agent.run(prompt)
-        output = result.output                 # TenanciousReviewerResult
-        final_decision = output.final_decision  # "merge" or "close"
-    """
+    """Final structured result returned by the PR reviewer agent."""
 
     final_decision: Literal["merge", "close"] = Field(
         description="Whether to merge the PR (comments were addressed) or close it (unfixable).",
@@ -406,7 +582,7 @@ class TenanciousReviewerResult(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Agent instructions (modern API: `instructions=` not `system_prompt=`)
+# Agent instructions
 # ═══════════════════════════════════════════════════════════════════════
 
 PR_REVIEWER_INSTRUCTIONS = """\
@@ -433,6 +609,7 @@ defensible interpretation and note it in `reasoning`.
    - `git add -A`
    - `git commit -m "<conventional message>"`
    - `git push` (NEVER force-push, NEVER amend someone else's commit)
+   - If there is nothing to change, do not invent a commit — leave `commit_sha` empty.
 
 4. **Decide**:
    - You addressed (or resolved) every comment → `final_decision = "merge"`.
@@ -441,7 +618,7 @@ change should not land → `final_decision = "close"`.
 
 ## Output
 
-Return a `TenanciousReviewerResult`:
+Return a `TenanciousReviewerResult` as a JSON object:
 - `final_decision`: `"merge"` or `"close"`
 - `summary`: one paragraph of what you did
 - `comments_addressed`: list each comment you addressed (by quote or file:line)
@@ -455,6 +632,7 @@ Return a `TenanciousReviewerResult`:
 - NEVER force-push or rewrite history.
 - Keep changes minimal and focused on the comments.
 - The local filesystem and terminal are real — use them.
+- You MUST finish by emitting the JSON object. Do not stop before that.
 """
 
 
@@ -463,56 +641,159 @@ def _build_review_prompt(pr_url: str, pr_number: int, repo_path: Path) -> str:
         f"Review and address PR {pr_url} (number #{pr_number}).\n"
         f"Work inside the local repository at {repo_path}.\n\n"
         f"Run `gh pr checkout {pr_number}` to get the branch, address every "
-        f"review comment, commit, push, and return your final_decision."
+        f"review comment, commit, push, and return your final_decision as JSON."
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ACP model factory with provider fallback
+# ACP model construction + session bootstrap
 # ═══════════════════════════════════════════════════════════════════════
 
 
-ProviderName = Literal["cline", "crush"]
+class AcpStartupError(RuntimeError):
+    """Raised when an ACP provider cannot be brought up to a usable session."""
 
 
-def _provider_command(provider: ProviderName) -> list[str]:
-    """Return the CLI command tuple for a given ACP provider name."""
-    return [provider]  # bare CLI name — must be on PATH
+async def _bootstrap_session(
+    provider: AcpProvider,
+    spec: ProviderSpec,
+    *,
+    startup_timeout: float,
+) -> str:
+    """Bring the ACP agent up to a live session and select a permission mode.
+
+    This is the preflight the previous revision lacked. ``create_acp_model``
+    only *describes* an agent — it spawns nothing — so wrapping it in
+    ``try/except`` could never detect a broken provider, and the "fallback"
+    was dead code. Here we actually perform ``initialize`` + ``session/new``,
+    so an unusable provider fails fast and loudly instead of hanging until
+    the review timeout.
+
+    We prefer pydantic-acp's public bootstrap API — ``provider.ensure_session()``
+    and ``provider.set_session_mode()`` — which perform ``initialize`` +
+    ``session/new`` (authenticating if the agent demands it) and set the
+    permission mode on the *same* session the prompt will reuse. Older library
+    versions lack those methods, so we fall back to the private
+    ``_ensure_session`` seam and ``provider.client.set_session_mode``.
+    """
+    ensure_public = getattr(provider, "ensure_session", None)
+    ensure = ensure_public or getattr(provider, "_ensure_session", None)
+    if ensure is None:  # pragma: no cover - library shape changed
+        raise AcpStartupError(
+            "pydantic-acp AcpProvider exposes neither ensure_session nor "
+            "_ensure_session; cannot preflight the ACP session."
+        )
+
+    try:
+        session_id = await asyncio.wait_for(
+            ensure() if ensure_public else ensure(model_name=None),
+            timeout=startup_timeout,
+        )
+    except TimeoutError as exc:
+        raise AcpStartupError(
+            f"timed out after {startup_timeout:.0f}s during ACP initialize/session-new. "
+            f"`{shlex.join(spec.command)}` did not complete the handshake — it is "
+            f"probably not an ACP stdio server or is waiting on interactive auth."
+        ) from exc
+    except Exception as exc:
+        raise AcpStartupError(
+            f"ACP handshake failed for `{shlex.join(spec.command)}`: {describe_exception(exc)}"
+        ) from exc
+
+    # Permission mode is best-effort: the right id differs per agent, and some
+    # agents have no modes at all. Without it, Claude Code sessions inherit
+    # `permissions.defaultMode` from settings.json — which for a "dontAsk"
+    # setting denies every tool call and produces a silent no-op review.
+    provider_set_mode = getattr(provider, "set_session_mode", None)
+    for mode in spec.modes:
+        try:
+            if provider_set_mode is not None:
+                await asyncio.wait_for(provider_set_mode(mode), timeout=30)
+            else:
+                client_set_mode = getattr(provider.client, "set_session_mode", None)
+                if client_set_mode is None:
+                    break
+                await asyncio.wait_for(
+                    client_set_mode(session_id=session_id, mode_id=mode), timeout=30
+                )
+        except Exception as exc:
+            logfire.debug("acp.set_mode_failed", mode=mode, error=describe_exception(exc))
+            continue
+        logfire.info("acp.session_mode", mode=mode)
+        console.print(f"[dim]  session mode: {mode}[/dim]")
+        break
+
+    return session_id
 
 
-def _resolve_model(
-    provider: ProviderName,
+async def _start_provider(
+    requested: ProviderName,
     repo_path: Path,
     delegate: LocalHostDelegate,
-) -> tuple[Any, ProviderName]:
-    """Return an ACP model, trying *provider* first then the other.
+    *,
+    startup_timeout: float,
+) -> tuple[AcpProvider, ProviderSpec]:
+    """Start the requested ACP provider, falling back through the registry.
 
-    No smoke test — the real ``agent.run`` will surface any provider error,
-    and we don't want to pay for a round-trip just to validate the bridge.
+    Unlike the previous revision, the fallback is real: each candidate is
+    actually launched and handshaken before being accepted.
     """
-    fallback: ProviderName = "crush" if provider == "cline" else "cline"
-    last_error: Exception | None = None
+    order: list[ProviderName] = [requested]
+    order += [p for p in FALLBACK_ORDER if p != requested]
 
-    for prov in (provider, fallback):
+    failures: list[str] = []
+
+    for key in order:
+        spec = PROVIDERS[key]
+        resolved = spec.available()
+        if resolved is None:
+            failures.append(f"{key}: `{spec.executable}` not on PATH")
+            continue
+
+        console.print(
+            f"[dim]→ starting ACP provider [bold]{key}[/bold]: "
+            f"{shlex.join(spec.command)}[/dim]"
+        )
+
+        agent_source = AcpCommandAgent(
+            options=AcpCommandOptions(
+                command=tuple(spec.command),
+                cwd=repo_path,
+                env=dict(spec.env) or None,
+                # "discard": agent stderr would otherwise interleave with our
+                # own Rich output and corrupt the display.
+                stderr_mode="discard",
+            ),
+        )
+        provider_kwargs: dict[str, Any] = {
+            "acp_agent": agent_source,
+            "host_client": delegate,
+            "cwd": str(repo_path),
+            "history_mode": "full",
+        }
+        # Turn an empty ACP turn into a legible ACP-specific error instead of
+        # pydantic-ai's opaque "Exceeded maximum retries". Only available on
+        # patched/newer pydantic-acp, so pass it conditionally.
+        if "raise_on_empty_turn" in inspect.signature(AcpProvider).parameters:
+            provider_kwargs["raise_on_empty_turn"] = True
+        provider = AcpProvider(**provider_kwargs)
+
         try:
-            cmd = _provider_command(prov)
-            model = create_acp_model(
-                acp_command=cmd,
-                cwd=str(repo_path),
-                delegate_client=delegate,
-                history_mode="full",
-            )
-            logfire.info("acp_provider_selected", provider=prov, command=cmd)
-            return model, prov
-        except Exception as exc:
-            last_error = exc
-            logfire.warning("provider_unavailable", provider=prov, error=str(exc))
-            console.print(f"[yellow]⚠ {prov} unavailable ({exc}), trying fallback...[/yellow]")
+            await _bootstrap_session(provider, spec, startup_timeout=startup_timeout)
+        except AcpStartupError as exc:
+            failures.append(f"{key}: {exc}")
+            console.print(f"[yellow]⚠ {key} unusable — {exc}[/yellow]")
+            logfire.warning("provider_unavailable", provider=key, error=str(exc))
+            with suppress(Exception):
+                await provider.close()
+            continue
 
-    raise RuntimeError(
-        f"Neither {provider} nor {fallback} is available as an ACP agent. "
-        f"Last error: {last_error}"
-    ) from last_error
+        logfire.info("acp_provider_selected", provider=key, command=list(spec.command))
+        console.print(f"[green]✓ ACP provider ready: [bold]{key}[/bold][/green]")
+        return provider, spec
+
+    detail = "\n  - ".join(failures) or "no providers configured"
+    raise AcpStartupError(f"No usable ACP provider. Tried:\n  - {detail}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -537,111 +818,179 @@ def _extract_repo_from_url(pr_url: str) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Merge / close: GitPython first, `gh` as fallback
+# git / gh helpers
+#
+# All PR state lives on the GitHub side, so `gh` is the only sane tool.
+# (The previous revision had a `_merge_pr_gitpython` fast path that
+# unconditionally raised ImportError to force the `gh` fallback — it did
+# nothing but cost a network fetch, so it is gone.)
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _list_open_pr_urls(repo_path: Path) -> list[str]:
-    """List open PR URLs. PR state lives on the GitHub side, so `gh` is used."""
-    proc = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--json",
-            "number,url",
-            "-q",
-            ".[] | .url",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=str(repo_path),
-        check=False,
-    )
-    if proc.returncode != 0:
-        err_console.print(f"[red]gh pr list failed: {proc.stderr.strip()}[/red]")
-        return []
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+@dataclass(frozen=True)
+class OpenPr:
+    number: int
+    url: str
+    title: str
+    head_sha: str
+    is_draft: bool
 
 
-def _gh_pr_command(args: list[str], repo_slug: str | None) -> tuple[int, str]:
-    """Run a `gh pr ...` command. Returns (rc, combined_output)."""
-    cmd = ["gh", "pr", *args]
-    if repo_slug:
-        cmd += ["-R", repo_slug]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 120) -> tuple[int, str]:
+    """Run a command, returning (rc, combined output). Never raises."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(cwd) if cwd else None,
+            check=False,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return 127, f"command not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout:.0f}s: {shlex.join(cmd)}"
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
-def _merge_pr_gitpython(repo_path: Path, pr_branch: str | None) -> tuple[bool, str]:
-    """Attempt a local merge via GitPython. Returns (success, message).
-
-    Used as a fast path for self-hosted / offline scenarios where pushing
-    directly to the base branch is acceptable. For GitHub-hosted repos with
-    branch protection this will raise, and the caller falls back to ``gh``.
-    """
-    try:
-        import git
-
-        repo = git.Repo(str(repo_path))
-        if pr_branch:
-            repo.remotes.origin.fetch(pr_branch)
-        # Without GitHub API auth, we can't reliably trigger a merge that
-        # satisfies branch protection — defer to the `gh` fallback path.
-        msg = "gitpython merge requires self-hosted base branch; deferring to gh"
-        raise ImportError(msg)
-    except Exception as exc:
-        return False, str(exc)
-
-
-def _merge_pr(
-    pr_number: int,
-    repo_slug: str | None,
-    repo_path: Path,
-    pr_branch: str | None = None,
-) -> tuple[int, str]:
-    """Merge PR. Tries GitPython local merge first, falls back to ``gh pr merge``.
-
-    In practice GitHub-side merges always go through ``gh pr merge`` because
-    a local merge + push to main is rarely what you want (no PR audit trail,
-    no merge-commit metadata, potential branch-protection failures). The
-    GitPython path exists for offline / self-hosted scenarios.
-    """
-    ok, _ = _merge_pr_gitpython(repo_path, pr_branch)
-    if ok:
-        logfire.info("merge_via_gitpython", pr_number=pr_number)
-        return 0, "merged via gitpython"
-    logfire.info("merge_via_gh", pr_number=pr_number)
-    return _gh_pr_command(
-        ["merge", str(pr_number), "--merge", "--delete-branch"], repo_slug
+def list_open_prs(repo_path: Path) -> list[OpenPr]:
+    """List open PRs with their head SHA (used to detect new pushes)."""
+    rc, out = _run(
+        [
+            "gh", "pr", "list",
+            "--state", "open",
+            "--limit", "100",
+            "--json", "number,url,title,headRefOid,isDraft",
+        ],
+        cwd=repo_path,
     )
+    if rc != 0:
+        err_console.print(f"[red]gh pr list failed (rc={rc}): {out}[/red]")
+        return []
+    try:
+        raw = json.loads(out or "[]")
+    except json.JSONDecodeError as exc:
+        err_console.print(f"[red]gh pr list returned invalid JSON: {describe_exception(exc)}[/red]")
+        return []
+    return [
+        OpenPr(
+            number=item["number"],
+            url=item["url"],
+            title=item.get("title", ""),
+            head_sha=item.get("headRefOid", ""),
+            is_draft=bool(item.get("isDraft")),
+        )
+        for item in raw
+    ]
 
 
-def _close_pr(
-    pr_number: int,
-    comment: str,
-    repo_slug: str | None,
+def _gh_pr_command(args: list[str], repo_slug: str | None, cwd: Path) -> tuple[int, str]:
+    cmd = ["gh", "pr", *args]
+    if repo_slug:
+        cmd += ["-R", repo_slug]
+    return _run(cmd, cwd=cwd, timeout=180)
+
+
+def merge_pr(pr_number: int, repo_slug: str | None, repo_path: Path) -> tuple[int, str]:
+    """Merge a PR via `gh pr merge`, retrying with --admin on protection errors."""
+    logfire.info("merge_via_gh", pr_number=pr_number)
+    rc, out = _gh_pr_command(
+        ["merge", str(pr_number), "--merge", "--delete-branch"], repo_slug, repo_path
+    )
+    if rc != 0 and ("not mergeable" in out.lower() or "protected" in out.lower()):
+        console.print("[yellow]  merge blocked; retrying with --admin[/yellow]")
+        rc, out = _gh_pr_command(
+            ["merge", str(pr_number), "--merge", "--delete-branch", "--admin"],
+            repo_slug,
+            repo_path,
+        )
+    return rc, out
+
+
+def close_pr(
+    pr_number: int, comment: str, repo_slug: str | None, repo_path: Path
 ) -> tuple[int, str]:
-    """Close PR with a comment and delete the branch (gh fallback only).
-
-    Closing a PR is a GitHub-side state change — there is no meaningful
-    local-only equivalent, so we always use ``gh pr close``.
-    """
+    """Close a PR with an explanatory comment and delete its branch."""
     logfire.info("close_via_gh", pr_number=pr_number)
     return _gh_pr_command(
-        ["close", str(pr_number), "--delete-branch", "--comment", comment], repo_slug
+        ["close", str(pr_number), "--delete-branch", "--comment", comment],
+        repo_slug,
+        repo_path,
     )
+
+
+def current_branch(repo_path: Path) -> str | None:
+    rc, out = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path, timeout=30)
+    return out.strip() if rc == 0 else None
+
+
+def restore_branch(repo_path: Path, branch: str | None) -> None:
+    """Return the working tree to *branch*, discarding the agent's checkout.
+
+    Continuous operation walks many PRs in one repo; each `gh pr checkout`
+    leaves the tree on that PR's branch. Without this, PR #2 would be reviewed
+    from PR #1's branch.
+    """
+    if not branch:
+        return
+    rc, out = _run(["git", "checkout", branch], cwd=repo_path, timeout=60)
+    if rc != 0:
+        err_console.print(f"[yellow]⚠ could not restore branch {branch}: {out}[/yellow]")
+
+
+def working_tree_dirty(repo_path: Path) -> bool:
+    rc, out = _run(["git", "status", "--porcelain"], cwd=repo_path, timeout=30)
+    return rc == 0 and bool(out.strip())
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Rich message rendering — spit out every ModelMessage subclass
+# Processed-PR state (so `watch` doesn't re-review the same PR forever)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def detect_repo_slug(repo_path: Path) -> str | None:
+    """Return ``owner/name`` for the repo, so state follows the repo not the path."""
+    rc, out = _run(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+        cwd=repo_path,
+        timeout=60,
+    )
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def _state_path(repo_slug: str | None, repo_path: Path) -> Path:
+    key = (repo_slug or str(repo_path.resolve())).replace("/", "_")
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    directory = base / "tenancious-pr-reviewer"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{key}.json"
+
+
+def load_state(repo_slug: str | None, repo_path: Path) -> dict[str, str]:
+    path = _state_path(repo_slug, repo_path)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(repo_slug: str | None, repo_path: Path, state: dict[str, str]) -> None:
+    path = _state_path(repo_slug, repo_path)
+    with suppress(OSError):
+        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Rich message rendering
 # ═══════════════════════════════════════════════════════════════════════
 
 
 def _print_messages(messages: Sequence[ModelMessage]) -> None:
-    """Render every ModelMessage emitted during the run using rich."""
+    """Render every ModelMessage emitted during the run."""
     console.rule(f"[bold cyan]Agent Messages ({len(messages)})[/bold cyan]")
 
     for i, msg in enumerate(messages, 1):
@@ -665,65 +1014,62 @@ def _print_messages(messages: Sequence[ModelMessage]) -> None:
                     rendered.append(f"[green]TextPart[/green]: {part.content}")
                 else:
                     rendered.append(f"[dim]{type(part).__name__}[/dim]")
-            body = "\n".join(rendered) or "[dim](empty)[/dim]"
+            body = "\n".join(rendered) or "[dim](empty — agent produced no text)[/dim]"
             console.print(Panel(body, title=f"#{i} ModelResponse", border_style="green"))
 
         else:
             console.print(
-                Panel(
-                    repr(msg),
-                    title=f"#{i} {type(msg).__name__}",
-                    border_style="dim",
-                )
+                Panel(repr(msg), title=f"#{i} {type(msg).__name__}", border_style="dim")
             )
 
     console.rule()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Hooks — observability during the run (best practice from skill)
-#
-# Hook callbacks CAN be sync — pydantic-ai accepts both sync and async
-# callables. Use sync unless you actually need to await; ruff will flag
-# ``async def`` that never awaits (RUF029).
+# Hooks — observability during the run
 # ═══════════════════════════════════════════════════════════════════════
 
 
 def _make_hooks() -> Hooks:
-    """Build lifecycle hooks that trace the run to the rich console + logfire.
+    """Lifecycle hooks that trace the run to logfire.
 
-    Per the logfire-instrumentation skill: emit structured log lines that
-    travel alongside the spans from ``logfire.instrument_pydantic_ai()``.
+    The signatures here are load-bearing and are NOT free-form: pydantic-ai
+    dispatches them by keyword, and every hook must return the value it was
+    given or the run dies at that point.
+
+        before_model_request(ctx, request_context) -> ModelRequestContext
+        before_tool_execute(ctx, *, call, tool_def, args) -> ValidatedToolArgs
+        after_run(ctx, *, result) -> AgentRunResult
+
+    Getting ``after_run`` wrong is especially cruel: the agent completes the
+    entire PR review, then the run explodes on the very last callback with
+    ``unexpected keyword argument 'result'`` and the work is thrown away.
     """
     hooks = Hooks()
 
     @hooks.on.before_model_request
-    def _trace_request(
-        ctx: RunContext[None],
-        request_context: Any,
-    ) -> Any:
+    def _trace_request(ctx: RunContext[None], request_context: Any) -> Any:
         del ctx
-        n = len(request_context.messages)
-        console.log(f"[dim]→ model request ({n} messages so far)[/dim]")
-        logfire.info("agent.model_request", messages=n)
+        logfire.info("agent.model_request", messages=len(request_context.messages))
         return request_context
 
     @hooks.on.before_tool_execute
     def _trace_tool(
         ctx: RunContext[None],
-        tool_name: str,
+        *,
+        call: Any,
+        tool_def: Any,
         args: Any,
     ) -> Any:
-        del ctx
-        console.log(f"[magenta]→ tool call: {tool_name}[/magenta]")
-        logfire.info("agent.tool_call", name=tool_name)
+        del ctx, tool_def
+        logfire.info("agent.tool_call", name=getattr(call, "tool_name", "?"))
         return args
 
     @hooks.on.after_run
-    def _trace_run_end(ctx: RunContext[None]) -> None:
+    def _trace_run_end(ctx: RunContext[None], *, result: Any) -> Any:
         del ctx
         logfire.info("agent.run_complete")
-        console.log("[dim]← run complete[/dim]")
+        return result
 
     return hooks
 
@@ -733,81 +1079,99 @@ def _make_hooks() -> Hooks:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+class ReviewFailed(RuntimeError):
+    """A review could not be completed — always carries a real reason."""
+
+
 async def _run_review(
     pr_url: str,
     pr_number: int,
     repo_path: Path,
-    provider: ProviderName,
+    provider_name: ProviderName,
     timeout_seconds: float,
+    *,
+    startup_timeout: float,
+    verbose: bool,
 ) -> tuple[TenanciousReviewerResult, Sequence[ModelMessage]]:
-    """Run the reviewer agent. Returns (result, all_messages).
-
-    Trusts blindly that pydantic-ai returns a ``TenanciousReviewerResult``:
-    no JSON parsing, no fallback, direct attribute access on the output.
-    """
+    """Run the reviewer agent. Returns (result, all_messages)."""
     repo_path = Path(str(repo_path)).resolve()  # noqa: ASYNC240
-    if not repo_path.exists():
-        repo_path.mkdir(parents=True, exist_ok=True)
+    if not repo_path.is_dir():
+        raise ReviewFailed(f"repository path does not exist: {repo_path}")
 
-    delegate = LocalHostDelegate(workspace_root=repo_path)
-    model, used_provider = _resolve_model(provider, repo_path, delegate)
-
-    # NOTE: ty infers the agent's output type from the ``output_type=`` argument.
-    # When using PromptedOutput, the inferred type is the wrapper — but the
-    # runtime ``.output`` is still the pydantic model. Leave the local
-    # variable unannotated so ty doesn't complain about the wrapper mismatch.
-    agent = Agent(
-        model,
-        name="tenancious_pr_reviewer",
-        # PromptedOutput (not the default ToolOutput) because the ACP bridge
-        # does not support the result-tool mechanism pydantic-ai uses to
-        # enforce structured output. PromptedOutput still returns a fully
-        # validated ``TenanciousReviewerResult`` on ``result.output``.
-        output_type=PromptedOutput(TenanciousReviewerResult),
-        instructions=PR_REVIEWER_INSTRUCTIONS,
-        capabilities=[_make_hooks()],
-        retries=2,
+    delegate = LocalHostDelegate(workspace_root=repo_path, verbose=verbose)
+    provider, spec = await _start_provider(
+        provider_name, repo_path, delegate, startup_timeout=startup_timeout
     )
 
-    prompt = _build_review_prompt(pr_url, pr_number, repo_path)
+    try:
+        model = provider.model(None, history_mode="full")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task: TaskID = progress.add_task(
-            f"[cyan]Reviewing PR #{pr_number} via [bold]{used_provider}[/bold]...",
-            total=None,
+        agent = Agent(
+            model,
+            name="tenancious_pr_reviewer",
+            # PromptedOutput (not the default ToolOutput) because the ACP
+            # bridge has no result-tool mechanism. PromptedOutput still yields
+            # a validated TenanciousReviewerResult on ``result.output``.
+            output_type=PromptedOutput(TenanciousReviewerResult),
+            instructions=PR_REVIEWER_INSTRUCTIONS,
+            capabilities=[_make_hooks()],
+            retries=2,
         )
 
-        try:
-            result = await asyncio.wait_for(
-                agent.run(prompt),
-                timeout=timeout_seconds,
-            )
-            progress.update(task, description="[green]✓ Review complete[/green]")
-        except TimeoutError:
-            progress.update(task, description="[red]✗ Review timed out[/red]")
-            logfire.error("review_timeout", timeout=timeout_seconds)
-            raise
-        except Exception as exc:
-            progress.update(task, description=f"[red]✗ Review failed: {exc}[/red]")
-            logfire.error("review_error", error=str(exc))
-            raise
+        prompt = _build_review_prompt(pr_url, pr_number, repo_path)
+        console.print(
+            f"[cyan]Reviewing PR #{pr_number} via [bold]{spec.key}[/bold] "
+            f"(timeout {timeout_seconds:.0f}s)[/cyan]"
+        )
+        started = time.monotonic()
 
-    # ── Blind trust: pydantic-ai returned the pydantic object. ──
-    # ty can't see through PromptedOutput's generic wrapper, so it infers
-    # `str` here. The runtime value IS a TenanciousReviewerResult.
-    output = cast("TenanciousReviewerResult", result.output)
-    final_decision = output.final_decision  # direct attribute access
-    logfire.info(
-        "review_decision",
-        final_decision=final_decision,
-        comments=len(output.comments_addressed),
-        sha=output.commit_sha,
-    )
-    return output, result.all_messages()
+        try:
+            result = await asyncio.wait_for(agent.run(prompt), timeout=timeout_seconds)
+        except TimeoutError as exc:
+            delegate.finish()
+            logfire.error("review_timeout", timeout=timeout_seconds)
+            raise ReviewFailed(
+                f"the review exceeded the {timeout_seconds:.0f}s timeout. "
+                f"The {spec.key} agent produced {delegate.text_chunks} text chunk(s) and "
+                f"{delegate.tool_calls} tool call(s) before the deadline. "
+                f"Raise --timeout if the PR is genuinely large."
+            ) from exc
+        except Exception as exc:
+            delegate.finish()
+            # The single most confusing ACP failure: the agent completes its
+            # turn but emits no agent_message_chunk at all. pydantic-ai then
+            # reports "Exceeded maximum output retries", which says nothing
+            # about the real cause. Translate it.
+            if delegate.text_chunks == 0:
+                raise ReviewFailed(
+                    f"the {spec.key} ACP agent completed its turn without producing any "
+                    f"text output ({delegate.tool_calls} tool call(s) seen). This almost "
+                    f"always means the agent is unauthenticated or its ACP mode is broken "
+                    f"— verify with `{shlex.join(spec.command)}` directly. "
+                    f"Underlying error: {describe_exception(exc)}"
+                ) from exc
+            logfire.error("review_error", error=describe_exception(exc))
+            raise ReviewFailed(describe_exception(exc)) from exc
+
+        delegate.finish()
+        elapsed = time.monotonic() - started
+        console.print(
+            f"[green]✓ Review complete in {elapsed:.0f}s[/green] "
+            f"[dim]({delegate.text_chunks} text chunks, {delegate.tool_calls} tool calls, "
+            f"{delegate.permissions_granted} permissions granted)[/dim]"
+        )
+
+        output = cast("TenanciousReviewerResult", result.output)
+        logfire.info(
+            "review_decision",
+            final_decision=output.final_decision,
+            comments=len(output.comments_addressed),
+            sha=output.commit_sha,
+        )
+        return output, result.all_messages()
+    finally:
+        with suppress(Exception):
+            await provider.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -818,18 +1182,24 @@ async def _run_review(
 def _do_review(
     pr_url: str,
     repo_path: Path,
-    provider: ProviderName,
+    provider_name: ProviderName,
     timeout: float,
+    *,
+    startup_timeout: float = 120.0,
+    dry_run: bool = False,
+    verbose: bool = False,
 ) -> int:
-    """Run the full pipeline for one PR. Returns process exit code."""
+    """Run the full pipeline for one PR. Returns 0 on success."""
     pr_number = _extract_pr_number(pr_url)
     repo_slug = _extract_repo_from_url(pr_url)
+    original_branch = current_branch(repo_path)
 
     console.print(
         Panel.fit(
             f"[bold cyan]Tenancious PR Reviewer[/bold cyan]\n"
             f"PR: [bold]#{pr_number}[/bold]  •  Repo: [dim]{repo_path}[/dim]\n"
-            f"Provider: [bold]{provider}[/bold]",
+            f"Provider: [bold]{provider_name}[/bold]"
+            + ("  •  [yellow]DRY RUN[/yellow]" if dry_run else ""),
             border_style="cyan",
         )
     )
@@ -838,43 +1208,66 @@ def _do_review(
 
     try:
         output, messages = asyncio.run(
-            _run_review(pr_url, pr_number, repo_path, provider, timeout)
+            _run_review(
+                pr_url,
+                pr_number,
+                repo_path,
+                provider_name,
+                timeout,
+                startup_timeout=startup_timeout,
+                verbose=verbose,
+            )
         )
-    except Exception as exc:
+    except (ReviewFailed, AcpStartupError) as exc:
+        # These already carry a full explanation.
         logfire.fatal("review_crashed", error=str(exc))
-        err_console.print(f"[red]❌ Fatal error: {exc}[/red]")
+        err_console.print(f"[red]❌ PR #{pr_number} failed:[/red] {exc}")
+        restore_branch(repo_path, original_branch)
+        return 1
+    except Exception as exc:
+        logfire.fatal("review_crashed", error=describe_exception(exc))
+        err_console.print(f"[red]❌ PR #{pr_number} failed:[/red] {describe_exception(exc)}")
+        restore_branch(repo_path, original_branch)
         return 1
 
-    # ── Spit out every ModelMessage / ModelRequest / UserPromptPart /
-    #    TextPart / ModelResponse with rich. ──
-    _print_messages(messages)
+    if verbose:
+        _print_messages(messages)
 
-    # ── Render the result. ──
     _render_result(output)
 
-    # ── Execute the decision. No asking the user. ──
+    if dry_run:
+        console.print(
+            f"[yellow]DRY RUN: would {output.final_decision} PR #{pr_number}[/yellow]"
+        )
+        restore_branch(repo_path, original_branch)
+        return 0
+
     if output.final_decision == "merge":
         console.print(f"[bold green]→ Merging PR #{pr_number}...[/bold green]")
-        rc, out = _merge_pr(pr_number, repo_slug, repo_path)
-    else:  # "close"
+        rc, out = merge_pr(pr_number, repo_slug, repo_path)
+    else:
         comment = (
             f"Closing per tenancious reviewer: {output.summary}\n\n"
             f"Reasoning: {output.reasoning}"
         )
         console.print(f"[bold red]→ Closing PR #{pr_number}...[/bold red]")
-        rc, out = _close_pr(pr_number, comment, repo_slug)
+        rc, out = close_pr(pr_number, comment, repo_slug, repo_path)
+
+    restore_branch(repo_path, original_branch)
 
     if rc == 0:
-        console.print("[green]✓ gh command succeeded[/green]")
+        console.print(f"[green]✓ PR #{pr_number} {output.final_decision}d[/green]")
     else:
-        console.print(f"[red]✗ gh command failed (rc={rc}):[/red]\n{out}")
+        err_console.print(
+            f"[red]✗ gh {output.final_decision} failed for PR #{pr_number} (rc={rc}):[/red]\n{out}"
+        )
     logfire.info("decision_executed", decision=output.final_decision, rc=rc, output=out)
 
     return 0 if rc == 0 else 1
 
 
 def _render_result(result: TenanciousReviewerResult) -> None:
-    """Pretty-print the structured result using Rich."""
+    """Pretty-print the structured result."""
     style = "green" if result.final_decision == "merge" else "red"
     icon = "✓" if result.final_decision == "merge" else "✗"
 
@@ -908,11 +1301,7 @@ def _render_result(result: TenanciousReviewerResult) -> None:
         )
     if result.commit_sha:
         body_parts.append(
-            Panel(
-                result.commit_sha,
-                title="[bold]Commit SHA[/bold]",
-                border_style="dim",
-            )
+            Panel(result.commit_sha, title="[bold]Commit SHA[/bold]", border_style="dim")
         )
     if result.reasoning:
         body_parts.append(
@@ -928,31 +1317,112 @@ def _render_result(result: TenanciousReviewerResult) -> None:
     )
 
 
+def _review_open_prs(
+    repo_path: Path,
+    provider_name: ProviderName,
+    timeout: float,
+    *,
+    include_drafts: bool,
+    dry_run: bool,
+    verbose: bool,
+    state: dict[str, str],
+    repo_slug: str | None,
+) -> tuple[int, int]:
+    """Review every eligible open PR. Returns (processed, failures)."""
+    prs = list_open_prs(repo_path)
+    if not prs:
+        console.print("[dim]No open PRs.[/dim]")
+        return 0, 0
+
+    eligible = [
+        pr
+        for pr in prs
+        if (include_drafts or not pr.is_draft) and state.get(str(pr.number)) != pr.head_sha
+    ]
+    skipped = len(prs) - len(eligible)
+    if skipped:
+        console.print(f"[dim]Skipping {skipped} PR(s) (draft or already processed).[/dim]")
+    if not eligible:
+        return 0, 0
+
+    console.print(f"[bold cyan]{len(eligible)} PR(s) to review.[/bold cyan]")
+    failures = 0
+    for pr in eligible:
+        console.rule(f"[bold cyan]PR #{pr.number}: {pr.title}[/bold cyan]")
+
+        if working_tree_dirty(repo_path):
+            err_console.print(
+                f"[red]✗ Skipping PR #{pr.number}: working tree is dirty. "
+                f"Commit or stash your changes first.[/red]"
+            )
+            failures += 1
+            continue
+
+        code = _do_review(
+            pr.url,
+            repo_path,
+            provider_name,
+            timeout,
+            dry_run=dry_run,
+            verbose=verbose,
+        )
+        if code != 0:
+            failures += 1
+        else:
+            # Record the head SHA so a re-run skips it until someone pushes.
+            state[str(pr.number)] = pr.head_sha
+            if not dry_run:
+                save_state(repo_slug, repo_path, state)
+
+    return len(eligible), failures
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Typer CLI
 # ═══════════════════════════════════════════════════════════════════════
 
 app = typer.Typer(
     name="pr-reviewer",
-    help="Autonomous PR reviewer: implements comments, then merges or closes.",
+    help="Autonomous PR reviewer: implements review comments, then merges or closes.",
     add_completion=False,
 )
+
+_VERBOSE = {"on": False}
+
+RepoOpt = Annotated[
+    Path,
+    typer.Option("--repo-path", "-r", help="Path to the local git repository"),
+]
+ProviderOpt = Annotated[
+    ProviderName,
+    typer.Option("--provider", "-p", help="ACP agent provider to use"),
+]
+TimeoutOpt = Annotated[
+    float,
+    typer.Option("--timeout", "-t", help="Maximum seconds for a single PR review"),
+]
+DryRunOpt = Annotated[
+    bool,
+    typer.Option("--dry-run", help="Review but never merge or close"),
+]
 
 
 @app.callback()
 def _callback(
     verbose: Annotated[
-        bool,
-        typer.Option("--verbose", "-v", help="Enable verbose / debug output"),
+        bool, typer.Option("--verbose", "-v", help="Enable verbose / debug output")
     ] = False,
 ) -> None:
+    _VERBOSE["on"] = verbose
     logfire.configure(
         send_to_logfire=False,
-        console=logfire.ConsoleOptions(verbose=verbose),
-        min_level="debug" if verbose else "info",
+        console=logfire.ConsoleOptions(verbose=verbose) if verbose else False,
+        min_level="debug" if verbose else "warn",
+        # Logfire's f-string introspection cannot find call sites inside this
+        # single-file script and warns noisily on every call. We pass explicit
+        # kwargs everywhere, so introspection buys us nothing.
+        inspect_arguments=False,
     )
-    # Best practice per building-pydantic-ai-agents skill:
-    # auto-trace every agent run, tool call, and model request.
     with suppress(Exception):
         logfire.instrument_pydantic_ai()
 
@@ -966,96 +1436,206 @@ def review(
             show_default=False,
         ),
     ],
-    repo_path: Annotated[
-        Path,
-        typer.Option(
-            "--repo-path", "-r",
-            help="Path to the local git repository",
-            exists=False,
-        ),
-    ] = Path.cwd(),
-    provider: Annotated[
-        ProviderName,
-        typer.Option(
-            "--provider", "-p",
-            help="ACP agent provider to use (cline or crush)",
-        ),
-    ] = "cline",
-    timeout: Annotated[
-        float,
-        typer.Option(
-            "--timeout", "-t",
-            help="Maximum time in seconds for the review",
-        ),
-    ] = 600.0,
+    repo_path: RepoOpt = Path.cwd(),
+    provider: ProviderOpt = "claude",
+    timeout: TimeoutOpt = 900.0,
+    dry_run: DryRunOpt = False,
 ) -> None:
-    """Review a PR, implement comments, then merge or close it."""
-    code = _do_review(pr_url, repo_path.resolve(), provider, timeout)
+    """Review one PR, implement its comments, then merge or close it."""
+    code = _do_review(
+        pr_url,
+        repo_path.resolve(),
+        provider,
+        timeout,
+        dry_run=dry_run,
+        verbose=_VERBOSE["on"],
+    )
     if code != 0:
         raise typer.Exit(code=code)
 
 
 @app.command(name="review-all")
 def review_all(
-    repo_path: Annotated[
-        Path,
-        typer.Option(
-            "--repo-path", "-r",
-            help="Path to the local git repository",
-            exists=False,
-        ),
-    ] = Path.cwd(),
-    provider: Annotated[
-        ProviderName,
-        typer.Option(
-            "--provider", "-p",
-            help="ACP agent provider to use (cline or crush)",
-        ),
-    ] = "cline",
-    timeout: Annotated[
-        float,
-        typer.Option(
-            "--timeout", "-t",
-            help="Maximum time in seconds per review",
-        ),
-    ] = 600.0,
+    repo_path: RepoOpt = Path.cwd(),
+    provider: ProviderOpt = "claude",
+    timeout: TimeoutOpt = 900.0,
+    dry_run: DryRunOpt = False,
+    include_drafts: Annotated[
+        bool, typer.Option("--include-drafts", help="Also review draft PRs")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-review PRs even if already processed")
+    ] = False,
 ) -> None:
-    """Review every open PR in the current repo, merge or close each."""
-    urls = _list_open_pr_urls(repo_path.resolve())
-    if not urls:
-        console.print("[yellow]No open PRs found.[/yellow]")
-        return
+    """Review every open PR in the repo, merging or closing each."""
+    repo = repo_path.resolve()
+    repo_slug = detect_repo_slug(repo)
+    state = {} if force else load_state(repo_slug, repo)
 
-    console.print(f"[bold cyan]Found {len(urls)} open PR(s).[/bold cyan]")
-    failures = 0
-    for url in urls:
-        console.rule(f"[bold cyan]PR: {url}[/bold cyan]")
-        code = _do_review(url, repo_path.resolve(), provider, timeout)
-        if code != 0:
-            failures += 1
+    processed, failures = _review_open_prs(
+        repo,
+        provider,
+        timeout,
+        include_drafts=include_drafts,
+        dry_run=dry_run,
+        verbose=_VERBOSE["on"],
+        state=state,
+        repo_slug=repo_slug,
+    )
 
     if failures:
-        console.print(f"[red]✗ {failures}/{len(urls)} PR(s) failed[/red]")
+        err_console.print(f"[red]✗ {failures}/{processed} PR(s) failed[/red]")
         raise typer.Exit(code=1)
-    console.print(f"[green]✓ All {len(urls)} PR(s) processed[/green]")
+    console.print(f"[green]✓ {processed} PR(s) processed[/green]")
+
+
+@app.command()
+def watch(
+    repo_path: RepoOpt = Path.cwd(),
+    provider: ProviderOpt = "claude",
+    timeout: TimeoutOpt = 900.0,
+    interval: Annotated[
+        float, typer.Option("--interval", "-i", help="Seconds between polling cycles")
+    ] = 300.0,
+    dry_run: DryRunOpt = False,
+    include_drafts: Annotated[
+        bool, typer.Option("--include-drafts", help="Also review draft PRs")
+    ] = False,
+) -> None:
+    """Continuously poll for open PRs and review each new one.
+
+    A PR is reviewed once per head SHA: pushing new commits makes it eligible
+    again. Failures never stop the loop.
+    """
+    repo = repo_path.resolve()
+    repo_slug = detect_repo_slug(repo)
+    state = load_state(repo_slug, repo)
+    cycle = 0
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Watching for PRs[/bold cyan]\n"
+            f"Repo: [dim]{repo}[/dim]\n"
+            f"Provider: [bold]{provider}[/bold]  •  every {interval:.0f}s"
+            + ("  •  [yellow]DRY RUN[/yellow]" if dry_run else ""),
+            border_style="cyan",
+        )
+    )
+
+    while True:
+        cycle += 1
+        console.rule(f"[dim]cycle {cycle}[/dim]")
+        try:
+            processed, failures = _review_open_prs(
+                repo,
+                provider,
+                timeout,
+                include_drafts=include_drafts,
+                dry_run=dry_run,
+                verbose=_VERBOSE["on"],
+                state=state,
+                repo_slug=repo_slug,
+            )
+            if processed:
+                console.print(
+                    f"[dim]cycle {cycle}: {processed} processed, {failures} failed[/dim]"
+                )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            # A cycle must never kill the watcher.
+            err_console.print(f"[red]cycle {cycle} error:[/red] {describe_exception(exc)}")
+
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            console.print("\n[dim]stopped[/dim]")
+            return
 
 
 @app.command()
 def providers() -> None:
-    """List available ACP providers and their status."""
+    """List ACP providers and whether their launcher is on PATH."""
     table = Table(title="ACP Providers", border_style="cyan")
     table.add_column("Provider", style="bold cyan")
-    table.add_column("Path", style="dim")
+    table.add_column("Launch command", style="dim")
     table.add_column("Status")
+    table.add_column("Notes", style="dim")
 
-    for name in ("cline", "crush"):
-        path = shutil.which(name)
-        if path:
-            table.add_row(name, path, "[green]✓ Available[/green]")
-        else:
-            table.add_row(name, "—", "[red]✗ Not found[/red]")
+    for key in FALLBACK_ORDER:
+        spec = PROVIDERS[key]
+        path = spec.available()
+        status = "[green]✓ on PATH[/green]" if path else "[red]✗ not found[/red]"
+        table.add_row(key, shlex.join(spec.command), status, spec.description)
 
     console.print(table)
+    console.print(
+        "\n[dim]`✓ on PATH` only means the launcher exists. Use "
+        "`doctor` to actually handshake with an agent.[/dim]"
+    )
+
+
+@app.command()
+def doctor(
+    repo_path: RepoOpt = Path.cwd(),
+    provider: ProviderOpt = "claude",
+    startup_timeout: Annotated[
+        float, typer.Option("--startup-timeout", help="Seconds allowed for the ACP handshake")
+    ] = 120.0,
+) -> None:
+    """Diagnose the environment: gh auth, git state, and a real ACP handshake."""
+    repo = repo_path.resolve()
+    ok = True
+
+    console.rule("[bold cyan]Environment[/bold cyan]")
+
+    rc, out = _run(["gh", "auth", "status"], cwd=repo, timeout=60)
+    if rc == 0:
+        console.print("[green]✓ gh authenticated[/green]")
+    else:
+        ok = False
+        err_console.print(f"[red]✗ gh not usable:[/red] {out}")
+
+    rc, out = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo, timeout=30)
+    if rc == 0 and out.strip() == "true":
+        branch = current_branch(repo)
+        dirty = working_tree_dirty(repo)
+        console.print(f"[green]✓ git repo[/green] [dim](branch {branch})[/dim]")
+        if dirty:
+            console.print("[yellow]⚠ working tree is dirty — reviews will be skipped[/yellow]")
+    else:
+        ok = False
+        err_console.print(f"[red]✗ not a git repository:[/red] {repo}")
+
+    prs = list_open_prs(repo)
+    console.print(f"[dim]open PRs: {len(prs)}[/dim]")
+    for pr in prs:
+        console.print(f"  [dim]#{pr.number} {pr.title} ({pr.head_sha[:8]})[/dim]")
+
+    console.rule("[bold cyan]ACP handshake[/bold cyan]")
+
+    async def _probe() -> None:
+        delegate = LocalHostDelegate(workspace_root=repo)
+        acp_provider, spec = await _start_provider(
+            provider, repo, delegate, startup_timeout=startup_timeout
+        )
+        console.print(f"[green]✓ session established with {spec.key}[/green]")
+        console.print(f"[dim]  session id: {acp_provider.session_id}[/dim]")
+        with suppress(Exception):
+            await acp_provider.close()
+
+    try:
+        asyncio.run(_probe())
+    except Exception as exc:
+        ok = False
+        err_console.print(f"[red]✗ ACP handshake failed:[/red] {describe_exception(exc)}")
+
+    console.print()
+    if ok:
+        console.print("[bold green]✓ ready[/bold green]")
+    else:
+        console.print("[bold red]✗ not ready — fix the items above[/bold red]")
+        raise typer.Exit(code=1)
 
 
 # ═══════════════════════════════════════════════════════════════════════
