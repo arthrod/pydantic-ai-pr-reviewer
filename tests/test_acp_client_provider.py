@@ -1,7 +1,7 @@
 from __future__ import annotations as _annotations
 
 import tomllib
-from importlib import metadata
+from importlib.metadata import requires, version
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -52,21 +52,20 @@ from .support import HostRecordingClient, RecordingClient
 
 
 def _model_config_option() -> SessionConfigOptionSelect:
-    """The selectable ``model`` session config option an ACP agent advertises.
+    """The ``model`` session config option an ACP agent must advertise to be selectable.
 
-    ``AcpProvider`` only switches models when the remote agent exposes this
-    option, so the agent doubles below advertise it to exercise that path.
+    ``AcpProvider`` only switches models on an agent that returns a ``select`` config
+    option with id ``model`` from ``new_session``; without it, asking for a specific
+    ``model_name`` is a ``UserError`` instead of a ``set_config_option`` call.
     """
     return SessionConfigOptionSelect(
-        type="select",
         id="model",
         name="Model",
-        current_value="agent",
+        type="select",
+        current_value="zed-agent",
         options=[
-            SessionConfigSelectOption(value="agent", name="Default"),
-            SessionConfigSelectOption(value="zed-agent", name="Zed Agent"),
-            SessionConfigSelectOption(value="model-a", name="Model A"),
-            SessionConfigSelectOption(value="model-b", name="Model B"),
+            SessionConfigSelectOption(value=model_name, name=model_name)
+            for model_name in ("zed-agent", "model-a", "model-b", "agent")
         ],
     )
 
@@ -145,8 +144,6 @@ class EchoACPAgent:  # type: ignore[misc]
     async def set_config_option(
         self, config_id: str, session_id: str, value: Any, **kwargs: Any
     ) -> None:
-        # Model selection is negotiated through the `model` session config option,
-        # so this is the call `AcpProvider` makes when the model name changes.
         del kwargs
         if config_id == "model":
             self.session_models.append((session_id, str(value)))
@@ -185,6 +182,14 @@ class EchoACPAgent:  # type: ignore[misc]
             config_options=[_model_config_option()],
         )
 
+    async def set_session_model(
+        self,
+        model_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> None:
+        del model_id, session_id, kwargs
+
     async def prompt(
         self,
         prompt: list[Any],
@@ -206,25 +211,6 @@ class EchoACPAgent:  # type: ignore[misc]
             source="echo-acp-agent",
         )
         return PromptResponse(stop_reason=self.stop_reason, usage=self.usage)
-
-
-def _pydantic_acp_dependencies() -> list[str]:
-    """Return the unconditional runtime requirements declared by installed `pydantic-acp`.
-
-    Requirements that only apply to an optional extra (``; extra == '...'``) are
-    dropped so callers see the same list a plain ``pip install pydantic-acp``
-    would pull in.
-    """
-    return [
-        requirement
-        for requirement in metadata.requires("pydantic-acp") or []
-        if "extra ==" not in requirement
-    ]
-
-
-def _repo_root() -> Path:
-    """Return the repository root, so file assertions do not depend on the CWD."""
-    return Path(__file__).resolve().parents[1]
 
 
 def _build_provider_and_model(
@@ -270,10 +256,13 @@ async def test_pydantic_ai_agent_can_use_acp_as_just_a_provider() -> None:
 
 
 def test_pydantic_acp_requires_pydantic_ai_v2() -> None:
-    # `pydantic-acp` is consumed here as a published distribution rather than as a
-    # source checkout, so its requirements are read from the installed metadata
-    # instead of a monorepo-relative `pyproject.toml` path.
-    dependencies: list[str] = _pydantic_acp_dependencies()
+    """``pydantic-acp`` must be built against pydantic-ai v2, never v1.
+
+    This repository consumes ``pydantic-acp`` as an installed distribution, not as a
+    path dependency inside the adapter's own monorepo, so the requirement is read
+    from the installed package metadata rather than a checked-in ``pyproject.toml``.
+    """
+    dependencies: list[str] = requires("pydantic-acp") or []
     pydantic_ai_dependency: str = next(
         dependency for dependency in dependencies if dependency.startswith("pydantic-ai-slim")
     )
@@ -589,7 +578,7 @@ class NoHandshakeACPAgent:  # type: ignore[misc]
         **kwargs: Any,
     ) -> NewSessionResponse:
         del cwd, mcp_servers, kwargs
-        return NewSessionResponse(session_id="session-1")
+        return NewSessionResponse(session_id="session-1", config_options=[_model_config_option()])
 
     async def prompt(
         self,
@@ -605,9 +594,7 @@ class NoHandshakeACPAgent:  # type: ignore[misc]
 async def test_acp_provider_does_not_require_the_agent_to_support_on_connect() -> None:
     acp_agent = NoHandshakeACPAgent()
     provider = AcpProvider(acp_agent=acp_agent, cwd="/workspace")
-    # This agent advertises no selectable `model` config option, so the provider's
-    # own factory is used to keep whatever model the remote agent defaults to.
-    model = provider.model()
+    model = AcpModel(model_name="agent", provider=provider)
 
     response = await model.request(
         [ModelRequest(parts=[UserPromptPart("hello")])],
@@ -1000,7 +987,7 @@ def test_render_tool_return_falls_back_to_tool_call_id_when_tool_name_is_empty()
 
 
 def test_root_pyproject_declares_pydantic_ai_v2_dependency() -> None:
-    root_pyproject = _repo_root() / "pyproject.toml"
+    root_pyproject = Path("pyproject.toml")
     data: dict[str, Any] = tomllib.loads(root_pyproject.read_text())
     dependencies: list[str] = data["project"]["dependencies"]
 
@@ -1008,13 +995,19 @@ def test_root_pyproject_declares_pydantic_ai_v2_dependency() -> None:
 
 
 def test_pydantic_acp_pins_agent_client_protocol_version_used_by_client_module() -> None:
-    # `pydantic-acp` pins `agent-client-protocol` exactly, and the client module talks
-    # to the `acp` package that pin installs. Asserting against the installed version
-    # keeps the two in lockstep without hardcoding a version that goes stale on every
-    # `pydantic-acp` upgrade.
-    installed_acp_version = metadata.version("agent-client-protocol")
+    """``pydantic-acp`` must pin the exact ``acp`` release the client module imports.
 
-    assert f"agent-client-protocol=={installed_acp_version}" in _pydantic_acp_dependencies()
+    The pin is asserted against the installed distributions rather than a hardcoded
+    version, so bumping ``agent-client-protocol`` keeps the two in lockstep instead
+    of silently drifting apart.
+    """
+    dependencies: list[str] = requires("pydantic-acp") or []
+    protocol_dependency: str = next(
+        dependency for dependency in dependencies if dependency.startswith("agent-client-protocol")
+    )
+    installed_protocol_version = version("agent-client-protocol")
+
+    assert protocol_dependency == f"agent-client-protocol=={installed_protocol_version}"
 
 
 # --- Additional coverage: public package exports for the client bridge (__init__.py) -----

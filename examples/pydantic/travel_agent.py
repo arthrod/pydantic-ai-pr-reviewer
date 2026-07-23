@@ -32,9 +32,9 @@ from pydantic_ai.tools import ToolDefinition
 
 __all__ = ("agent", "config", "main")
 
-# The workspace the demo tools are allowed to touch. Kept as a module-level
-# global (rather than captured in a closure) so it can be pointed at a temporary
-# directory from tests.
+
+# The workspace lives next to the process working directory so an ACP client can
+# watch the diffs land somewhere obvious; tests point it at a tmp_path instead.
 _TRAVEL_ROOT = Path("native-demo")
 
 _ITINERARY = """# Travel Brief
@@ -46,7 +46,7 @@ _ITINERARY = """# Travel Brief
 
 
 def _ensure_travel_workspace() -> Path:
-    """Create the trip workspace (and its starter itinerary) if it is missing."""
+    """Create the trip workspace (with a seed itinerary) and return its root."""
     _TRAVEL_ROOT.mkdir(parents=True, exist_ok=True)
     itinerary = _TRAVEL_ROOT / "itinerary.md"
     if not itinerary.exists():
@@ -101,12 +101,12 @@ def _open_containing_dir(parts: tuple[str, ...], *, create: bool) -> int:
 hooks = Hooks()
 
 
-@hooks.on.before_model_request
+@hooks.on.before_model_request()
 async def observe_before_model_request(
     ctx: RunContext[None],
     request_context: ModelRequestContext,
 ) -> ModelRequestContext:
-    """Surface every model request to the ACP client without changing it."""
+    """Pass the request through untouched; the adapter reports the hook to the client."""
     del ctx
     return request_context
 
@@ -119,20 +119,21 @@ async def observe_write_tool(
     tool_def: ToolDefinition,
     args: ValidatedToolArgs,
 ) -> ValidatedToolArgs:
-    """Surface writes to the ACP client without changing the arguments."""
+    """Pass the write arguments through untouched, so the client can see the call."""
     del ctx, call, tool_def
     return args
 
 
 agent = Agent(
     "openai:gpt-5",
-    # Resolve the model on first run rather than at import, so this module can be
-    # imported (and its tools inspected) without provider credentials present.
+    # The ACP client supplies the credentials, so defer the model check to keep
+    # this module importable (and testable) without any provider configured.
     defer_model_check=True,
     capabilities=[hooks],
     instructions=(
         "You are a travel assistant working in a small trip workspace. "
-        "Use read_trip_file to look at existing notes and write_trip_file to record new ones."
+        "Use read_trip_file to look at existing notes and write_trip_file "
+        "to record new ones."
     ),
 )
 
@@ -156,7 +157,7 @@ def read_trip_file(path: str, max_chars: int = 4000) -> str:
 
 @agent.tool_plain(requires_approval=True)
 def write_trip_file(path: str, content: str) -> str:
-    """Write a file into the trip workspace. Requires the client's approval."""
+    """Write a file into the trip workspace (requires client approval)."""
     parts = _trip_path_parts(path)
     dir_fd = _open_containing_dir(parts, create=True)
     try:
@@ -185,8 +186,8 @@ config = AdapterConfig(
         ),
     ),
     hook_projection_map=HookProjectionMap(
-        # "Before Execute" reads better than the default "Before Tool" next to the
-        # tool name this demo always shows in hook titles.
+        # Keep the default hook labels and only shorten the tool-execute one, so
+        # the client shows "Before Execute [write_trip_file] (observe_write_tool)".
         event_labels={
             **HookProjectionMap().event_labels,
             "before_tool_execute": "Before Execute",

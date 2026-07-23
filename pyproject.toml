@@ -11,10 +11,11 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "pytest>=8.3.0",
-    "pytest-asyncio>=1.0.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# The suite writes bare `async def test_...` functions, so asyncio tests are
+# collected without needing a marker on every one of them.
 asyncio_mode = "auto"

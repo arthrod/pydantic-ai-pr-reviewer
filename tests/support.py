@@ -28,7 +28,7 @@ class RecordingClient(RecordingACPClient):
     ``queue_permission_selected`` / ``queue_permission_cancelled``.
     """
 
-    updates: list[tuple[str, Any]]  # type: ignore[assignment]
+    updates: list[tuple[str, Any]]
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         del kwargs
