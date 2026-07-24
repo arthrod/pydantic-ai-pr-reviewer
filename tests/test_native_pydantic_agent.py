@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from pydantic_ai import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.messages import UserPromptPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -21,6 +22,7 @@ from .pydantic.support import (
 
 def _load_demo_module():
     module_path = Path(__file__).resolve().parents[1] / "examples" / "pydantic" / "travel_agent.py"
+    assert module_path.is_file(), f"demo module is missing: {module_path}"
     spec = importlib.util.spec_from_file_location("travel_agent_demo", module_path)
     assert spec is not None
     assert spec.loader is not None
@@ -193,3 +195,100 @@ def test_native_pydantic_agent_write_prompt_emits_hook_and_diff(
     assert (tmp_path / "native-demo" / "scratch.txt").read_text(encoding="utf-8") == (
         "hello from the native demo"
     )
+
+
+def test_read_trip_file_rejects_negative_max_chars(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", tmp_path / "native-demo")
+    demo._ensure_travel_workspace()
+
+    with pytest.raises(ValueError, match="max_chars must be non-negative"):
+        demo.read_trip_file("itinerary.md", max_chars=-1)
+
+
+def test_read_trip_file_honours_zero_and_positive_limits(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", tmp_path / "native-demo")
+    demo._ensure_travel_workspace()
+
+    assert demo.read_trip_file("itinerary.md", max_chars=0) == ""
+    assert demo.read_trip_file("itinerary.md", max_chars=6) == demo._ITINERARY[:6]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "../escape.txt", "nested/../../escape.txt", "", "."],
+)
+def test_trip_tools_reject_paths_outside_the_workspace(monkeypatch, tmp_path, path) -> None:
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", tmp_path / "native-demo")
+    demo._ensure_travel_workspace()
+
+    with pytest.raises(ValueError, match="outside the trip workspace"):
+        demo.write_trip_file(path, "nope")
+    with pytest.raises(ValueError, match="outside the trip workspace"):
+        demo.read_trip_file(path)
+
+
+def test_write_trip_file_refuses_to_follow_a_symlinked_target(monkeypatch, tmp_path) -> None:
+    """A symlink planted inside the workspace must not redirect the write out of it."""
+    root = tmp_path / "native-demo"
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", root)
+    demo._ensure_travel_workspace()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("untouched", encoding="utf-8")
+    (root / "sneaky.txt").symlink_to(outside)
+
+    with pytest.raises(OSError):
+        demo.write_trip_file("sneaky.txt", "pwned")
+    with pytest.raises(OSError):
+        demo.read_trip_file("sneaky.txt")
+    assert outside.read_text(encoding="utf-8") == "untouched"
+
+
+def test_ensure_travel_workspace_does_not_seed_through_a_symlink(monkeypatch, tmp_path) -> None:
+    """A pre-planted itinerary.md symlink must not receive the seed write."""
+    root = tmp_path / "native-demo"
+    root.mkdir()
+    outside = tmp_path / "outside-itinerary.md"
+    outside.write_text("untouched", encoding="utf-8")
+    (root / "itinerary.md").symlink_to(outside)
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", root)
+
+    assert demo._ensure_travel_workspace() == root
+    assert outside.read_text(encoding="utf-8") == "untouched"
+
+
+def test_open_containing_dir_refuses_symlinked_workspace_root(monkeypatch, tmp_path) -> None:
+    """If `_TRAVEL_ROOT` itself is a symlink, descriptor opens must refuse it."""
+    real_root = tmp_path / "real-demo"
+    real_root.mkdir()
+    link_root = tmp_path / "native-demo"
+    link_root.symlink_to(real_root, target_is_directory=True)
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", link_root)
+
+    with pytest.raises(OSError):
+        demo.write_trip_file("note.txt", "pwned")
+    assert not (real_root / "note.txt").exists()
+
+
+def test_write_trip_file_refuses_to_follow_a_symlinked_parent(monkeypatch, tmp_path) -> None:
+    """The no-follow guard applies to every path component, not just the last one."""
+    root = tmp_path / "native-demo"
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", root)
+    demo._ensure_travel_workspace()
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (root / "sneaky").symlink_to(outside_dir, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        demo.write_trip_file("sneaky/note.txt", "pwned")
+    assert not (outside_dir / "note.txt").exists()
+
+
+def test_write_trip_file_creates_nested_directories(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "native-demo"
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", root)
+    demo._ensure_travel_workspace()
+
+    assert demo.write_trip_file("notes/day-1/plan.md", "walk the old town") == (
+        "wrote 17 characters to notes/day-1/plan.md"
+    )
+    assert demo.read_trip_file("notes/day-1/plan.md") == "walk the old town"
