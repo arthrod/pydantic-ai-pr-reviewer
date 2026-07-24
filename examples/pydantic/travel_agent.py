@@ -46,11 +46,28 @@ _ITINERARY = """# Travel Brief
 
 
 def _ensure_travel_workspace() -> Path:
-    """Create the trip workspace (with a seed itinerary) and return its root."""
+    """Create the trip workspace (with a seed itinerary) and return its root.
+
+    Seed creation uses descriptor-relative, no-follow opens so a symlink planted
+    at ``itinerary.md`` cannot redirect the seed write outside the workspace.
+    """
     _TRAVEL_ROOT.mkdir(parents=True, exist_ok=True)
-    itinerary = _TRAVEL_ROOT / "itinerary.md"
-    if not itinerary.exists():
-        itinerary.write_text(_ITINERARY, encoding="utf-8")
+    root_fd = os.open(_TRAVEL_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            fd = os.open(
+                "itinerary.md",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=root_fd,
+            )
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(_ITINERARY)
+    finally:
+        os.close(root_fd)
     return _TRAVEL_ROOT
 
 
@@ -81,7 +98,9 @@ def _open_containing_dir(parts: tuple[str, ...], *, create: bool) -> int:
     outside the workspace. The caller owns the returned descriptor.
     """
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    dir_fd = os.open(_ensure_travel_workspace(), os.O_RDONLY | os.O_DIRECTORY)
+    # O_NOFOLLOW on the workspace root itself — not only on child components —
+    # so a symlink swapped in for `_TRAVEL_ROOT` cannot redirect the tree.
+    dir_fd = os.open(_ensure_travel_workspace(), dir_flags)
     try:
         for component in parts[:-1]:
             if create:

@@ -243,6 +243,32 @@ def test_write_trip_file_refuses_to_follow_a_symlinked_target(monkeypatch, tmp_p
     assert outside.read_text(encoding="utf-8") == "untouched"
 
 
+def test_ensure_travel_workspace_does_not_seed_through_a_symlink(monkeypatch, tmp_path) -> None:
+    """A pre-planted itinerary.md symlink must not receive the seed write."""
+    root = tmp_path / "native-demo"
+    root.mkdir()
+    outside = tmp_path / "outside-itinerary.md"
+    outside.write_text("untouched", encoding="utf-8")
+    (root / "itinerary.md").symlink_to(outside)
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", root)
+
+    assert demo._ensure_travel_workspace() == root
+    assert outside.read_text(encoding="utf-8") == "untouched"
+
+
+def test_open_containing_dir_refuses_symlinked_workspace_root(monkeypatch, tmp_path) -> None:
+    """If `_TRAVEL_ROOT` itself is a symlink, descriptor opens must refuse it."""
+    real_root = tmp_path / "real-demo"
+    real_root.mkdir()
+    link_root = tmp_path / "native-demo"
+    link_root.symlink_to(real_root, target_is_directory=True)
+    monkeypatch.setattr(demo, "_TRAVEL_ROOT", link_root)
+
+    with pytest.raises(OSError):
+        demo.write_trip_file("note.txt", "pwned")
+    assert not (real_root / "note.txt").exists()
+
+
 def test_write_trip_file_refuses_to_follow_a_symlinked_parent(monkeypatch, tmp_path) -> None:
     """The no-follow guard applies to every path component, not just the last one."""
     root = tmp_path / "native-demo"
